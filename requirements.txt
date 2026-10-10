@@ -1,0 +1,19 @@
+# ---------------------------------------------------------
+# 5G Navigation Project - Edge Server Dependencies
+# ---------------------------------------------------------
+
+# --- Vision Module (YOLOv8 & Depth Estimation) ---
+ultralytics>=8.0.0        # YOLOv8 object detection
+opencv-python>=4.8.0      # Computer vision and video frame processing (cv2)
+torch>=2.0.0              # PyTorch for AI depth estimation models (e.g., MiDaS)
+torchvision>=0.15.0       # Vision models for PyTorch
+
+# --- Navigation & Voice Module (STT & TTS) ---
+SpeechRecognition>=3.10.0 # Converts spoken microphone audio into text
+PyAudio>=0.2.11           # Required by SpeechRecognition to access the laptop microphone
+gTTS>=2.3.2               # Google Text-to-Speech (converts text route back to audio)
+playsound==1.2.2          # Plays the generated TTS audio out loud (v1.2.2 is most stable)
+
+# --- Networking & APIs ---
+requests>=2.31.0          # HTTP library to communicate with OSRM and Geocoding APIs
+timm>=0.9.0               # Required by MiDaS Depth Estimator
