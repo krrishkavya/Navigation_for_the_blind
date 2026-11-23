@@ -1,0 +1,551 @@
+# =========================================================================
+# 5G WEARABLE ASSISTIVE DEVICE - LINUX MPU CLIENT (ARDUINO UNO Q)
+# Communicates with:
+#   1. STM32 MCU via RouterBridge RPC / Serial (Live HC-SR04 Ultrasonic)
+#   2. USB Camera (/dev/video*) with deep hardware diagnostic reporting
+#   3. Edge Server on Laptop via Cloudflare Tunnel / UDP
+# =========================================================================
+
+import os
+# Silence internal OpenCV / GStreamer C++ warnings when probing devices
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
+
+import socket
+import json
+import time
+import cv2
+import threading
+
+if hasattr(cv2, "setLogLevel"):
+    cv2.setLogLevel(0)
+
+# --- 1. NETWORK CONFIGURATION ---
+# Optional: Hardcode your Cloudflare URL if desired, OR leave empty to use
+# 100% Autonomous Cloud Sync (Auto-discovers the active server with zero field edits).
+CLOUDFLARE_URL   = "" 
+
+# Shared Cloud Sync Topic (Matches edge_server/tunnel_manager.py for zero-touch discovery)
+CLOUD_SYNC_TOPIC = "iitg_5g_wearable_nav_sync_9169957"
+
+def fetch_active_cloud_url(timeout=3.0):
+    """
+    Auto-discovers the active Edge Server Cloudflare URL from the Cloud Sync topic.
+    Eliminates the need to ever open Arduino App Lab or manually edit URLs in the field.
+    """
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{CLOUD_SYNC_TOPIC}/json?poll=1",
+            headers={"User-Agent": "Wearable-Arduino-Client"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8").strip()
+            for line in reversed(body.split("\n")):
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                    if data.get("event") == "message":
+                        url = data.get("message", "").strip()
+                        if url.startswith("http://") or url.startswith("https://"):
+                            return url
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
+
+# Local Network Fallback IP (only used if Cloudflare / Cloud Sync is unavailable)
+EDGE_SERVER_IP   = "192.168.0.108"
+VIDEO_PORT       = 5005     # UDP video stream to Edge Server
+TELEMETRY_PORT   = 5006     # UDP distance telemetry to Edge Server
+DOWNLINK_PORT    = 5007     # UDP incoming obstacle alerts from Edge Server
+
+# Global hardware state (Pure Real-World Hardware - Zero Synthetic Noise)
+current_distance_cm = 400.0
+bridge_instance     = None
+serial_device       = None
+hardware_connected  = False
+
+# -------------------------------------------------------------------------
+# Zero-Dependency RFC 6455 WebSocket Client (Pure Python socket + ssl)
+# Enables cross-network video & telemetry streaming over Cloudflare Tunnel
+# -------------------------------------------------------------------------
+import socket
+import ssl
+import base64
+
+class RawWebSocketClient:
+    """Zero-dependency WebSocket client for cross-network 5G uplink."""
+    def __init__(self, url):
+        self.url = url
+        self.sock = None
+        self.is_connected = False
+        self._parse_url()
+
+    def _parse_url(self):
+        url = self.url.strip()
+        if url.startswith("wss://"):
+            self.use_ssl = True
+            rem = url[6:]
+        elif url.startswith("ws://"):
+            self.use_ssl = False
+            rem = url[5:]
+        elif url.startswith("https://"):
+            self.use_ssl = True
+            rem = url[8:]
+        elif url.startswith("http://"):
+            self.use_ssl = False
+            rem = url[7:]
+        else:
+            self.use_ssl = True
+            rem = url
+
+        parts = rem.split("/", 1)
+        host_port = parts[0].split(":")
+        self.host = host_port[0]
+        self.port = int(host_port[1]) if len(host_port) > 1 else (443 if self.use_ssl else 80)
+        self.path = "/" + parts[1] if len(parts) > 1 else "/ws"
+        if not self.path.endswith("/ws"):
+            self.path = self.path.rstrip("/") + "/ws"
+
+    def connect(self):
+        try:
+            raw_sock = socket.create_connection((self.host, self.port), timeout=3.0)
+            if self.use_ssl:
+                ctx = ssl.create_default_context()
+                self.sock = ctx.wrap_socket(raw_sock, server_hostname=self.host)
+            else:
+                self.sock = raw_sock
+
+            key = base64.b64encode(os.urandom(16)).decode('utf-8')
+            handshake = (
+                f"GET {self.path} HTTP/1.1\r\n"
+                f"Host: {self.host}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            self.sock.sendall(handshake.encode('utf-8'))
+
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = self.sock.recv(1024)
+                if not chunk:
+                    break
+                response += chunk
+
+            if b"101" in response:
+                self.is_connected = True
+                return True
+        except Exception:
+            self.is_connected = False
+            if self.sock:
+                try: self.sock.close()
+                except Exception: pass
+                self.sock = None
+        return False
+
+    def send_binary(self, data_bytes):
+        if not self.is_connected or not self.sock:
+            return False
+        return self._send_frame(0x02, data_bytes)
+
+    def send_text(self, text_str):
+        if not self.is_connected or not self.sock:
+            return False
+        return self._send_frame(0x01, text_str.encode('utf-8'))
+
+    def _send_frame(self, opcode, payload):
+        try:
+            length = len(payload)
+            header = bytearray()
+            header.append(0x80 | (opcode & 0x0F))
+
+            if length < 126:
+                header.append(0x80 | length)
+            elif length < 65536:
+                header.append(0x80 | 126)
+                header.extend(length.to_bytes(2, 'big'))
+            else:
+                header.append(0x80 | 127)
+                header.extend(length.to_bytes(8, 'big'))
+
+            mask = os.urandom(4)
+            header.extend(mask)
+
+            masked = bytearray(length)
+            for i in range(length):
+                masked[i] = payload[i] ^ mask[i % 4]
+
+            self.sock.sendall(header + masked)
+            return True
+        except Exception:
+            self.is_connected = False
+            if self.sock:
+                try: self.sock.close()
+                except Exception: pass
+                self.sock = None
+            return False
+
+    def close(self):
+        self.is_connected = False
+        if self.sock:
+            try: self.sock.close()
+            except Exception: pass
+            self.sock = None
+
+# -------------------------------------------------------------------------
+# Connect to the STM32 MCU (RouterBridge Primary, Serial Fallback)
+# -------------------------------------------------------------------------
+def init_hardware_link():
+    global bridge_instance, serial_device, hardware_connected
+
+    # Method 1: Arduino UNO Q Native RouterBridge (MessagePack-RPC over IPC)
+    try:
+        from arduino.router_bridge import Bridge
+        b = Bridge()
+        if b.connect(timeout=3):
+            print("🔌 [HARDWARE LINK]: Successfully linked to STM32 MCU via RouterBridge!")
+            bridge_instance = b
+            hardware_connected = True
+            return
+        else:
+            print("ℹ️ RouterBridge connect timeout. Attempting serial fallback...")
+    except ImportError:
+        print("ℹ️ 'arduino.router_bridge' not in environment. Attempting serial fallback...")
+    except Exception as e:
+        print(f"ℹ️ RouterBridge connection note: {e}. Attempting serial fallback...")
+
+    # Method 2: Serial Port Fallback (Reads JSON {"dist": XX.X} directly)
+    import glob
+    try:
+        import serial
+        potential_ports = (
+            glob.glob("/dev/ttyACM*") + 
+            glob.glob("/dev/ttyUSB*") + 
+            glob.glob("/dev/ttyHS*") + 
+            glob.glob("/dev/ttyMSM*") + 
+            glob.glob("/dev/ttyS[0-9]*") + 
+            [f"COM{i}" for i in range(1, 15)]
+        )
+        for port in potential_ports:
+            try:
+                ser = serial.Serial(port, 115200, timeout=0.1)
+                print(f"🔌 [HARDWARE LINK]: Linked to STM32 MCU on Serial port {port}")
+                serial_device = ser
+                hardware_connected = True
+                
+                # Dedicated thread to keep serial buffer drained and distance fresh
+                def serial_worker():
+                    global current_distance_cm
+                    while True:
+                        try:
+                            line = ser.readline().decode('utf-8', errors='ignore').strip()
+                            if line.startswith("{") and line.endswith("}"):
+                                data = json.loads(line)
+                                if "dist" in data:
+                                    current_distance_cm = float(data["dist"])
+                        except Exception:
+                            time.sleep(0.02)
+                
+                threading.Thread(target=serial_worker, daemon=True).start()
+                return
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    if not hardware_connected:
+        print("⚠️ [HARDWARE NOTICE]: Waiting for STM32 MCU heartbeat...")
+
+# -------------------------------------------------------------------------
+# Read Real Ultrasonic Distance from MCU
+# -------------------------------------------------------------------------
+def read_ultrasonic_distance():
+    global current_distance_cm, bridge_instance
+    if bridge_instance:
+        try:
+            # Query the live distance from the get_distance function in sketch.ino
+            val = bridge_instance.call("get_distance", timeout=0.20)
+            if val is not None:
+                current_distance_cm = float(val)
+                return round(current_distance_cm, 1)
+        except Exception:
+            pass  # Fall through to last recorded distance
+            
+    return round(current_distance_cm, 1)
+
+# -------------------------------------------------------------------------
+# Comprehensive Hot-Pluggable Camera Detector with Raw Kernel Diagnostics
+# -------------------------------------------------------------------------
+def detect_camera():
+    import glob, subprocess
+
+    devices = sorted(glob.glob("/dev/video*"))
+    
+    # Periodic diagnostic print to inform the user exactly what the OS sees
+    now = time.time()
+    if now - getattr(detect_camera, "_last_diag_time", 0) >= 5.0:
+        detect_camera._last_diag_time = now
+        
+        # 1. Enumerate video nodes and their driver names from sysfs
+        video_info = []
+        for dev in devices:
+            node_name = os.path.basename(dev)
+            name_file = f"/sys/class/video4linux/{node_name}/name"
+            label = dev
+            if os.path.exists(name_file):
+                try:
+                    with open(name_file, "r") as f:
+                        label = f"{dev} ({f.read().strip()})"
+                except Exception:
+                    pass
+            video_info.append(label)
+
+        # 2. Enumerate USB devices from sysfs (zero external binaries required)
+        usb_devices = []
+        for prod_path in glob.glob("/sys/bus/usb/devices/*/product"):
+            try:
+                dev_dir = os.path.dirname(prod_path)
+                with open(prod_path, "r") as f:
+                    prod = f.read().strip()
+                mfg = ""
+                mfg_path = os.path.join(dev_dir, "manufacturer")
+                if os.path.exists(mfg_path):
+                    with open(mfg_path, "r") as f:
+                        mfg = f.read().strip()
+                usb_devices.append(f"{mfg} {prod}".strip())
+            except Exception:
+                pass
+
+        # 3. Check and attempt to enforce USB Host Mode Role
+        roles = []
+        for role_path in glob.glob("/sys/class/usb_role/*/role"):
+            try:
+                with open(role_path, "r+") as f:
+                    curr = f.read().strip()
+                    roles.append(curr)
+                    if curr != "host":
+                        try:
+                            f.seek(0)
+                            f.write("host")
+                            roles.append("-> switched to host")
+                        except Exception as write_err:
+                            roles.append(f"(write err: {write_err})")
+            except Exception:
+                pass
+
+        print(f"🔍 [HARDWARE SCAN]: Video nodes: {video_info if video_info else 'None'}")
+        print(f"   ↳ USB Bus Devices : {', '.join(usb_devices) if usb_devices else 'No USB devices enumerated by kernel'}")
+        print(f"   ↳ USB Port Role   : {roles if roles else 'Unknown'}")
+
+    # Exclude internal Qualcomm Venus encoder/decoder nodes (video0, video1)
+    # External UVC webcams always enumerate on video2, video3, etc.
+    camera_candidates = [d for d in devices if d not in ("/dev/video0", "/dev/video1")]
+    if not camera_candidates:
+        # Fallback to checking video2 directly
+        camera_candidates = ["/dev/video2", "/dev/video3"]
+
+    for dev in camera_candidates:
+        suffix = dev.replace("/dev/video", "")
+        dev_idx = int(suffix) if suffix.isdigit() else 2
+
+        # Try opening via V4L2 backend and CAP_ANY
+        open_attempts = [
+            (dev_idx, getattr(cv2, "CAP_V4L2", cv2.CAP_ANY)),
+            (dev_idx, cv2.CAP_ANY),
+            (dev, getattr(cv2, "CAP_V4L2", cv2.CAP_ANY)),
+            (dev, cv2.CAP_ANY)
+        ]
+
+        for target, backend in open_attempts:
+            try:
+                cap = cv2.VideoCapture(target, backend) if isinstance(target, int) else cv2.VideoCapture(target)
+                if cap.isOpened():
+                    ret, test_frame = cap.read()
+                    if ret and test_frame is not None:
+                        print(f"📷 [CAMERA ONLINE]: Successfully streaming video from {dev} (Index {dev_idx})!")
+                        return cap
+                    cap.release()
+            except Exception:
+                continue
+
+    return None
+
+# -------------------------------------------------------------------------
+# Main Execution Loop
+# -------------------------------------------------------------------------
+def main():
+    print("==================================================")
+    print("   5G WEARABLE ASSISTIVE DEVICE - ARDUINO UNO Q   ")
+    print("==================================================")
+    print(f"📡 Target Edge Server IP  : {EDGE_SERVER_IP}")
+    print(f"🎥 Video Uplink Port      : {VIDEO_PORT} (UDP)")
+    print(f"🧭 Telemetry Uplink Port  : {TELEMETRY_PORT} (UDP)")
+    print(f"👂 Downlink Listen Port   : {DOWNLINK_PORT} (UDP)")
+    print("==================================================")
+
+    # 1. Establish hardware link with STM32 MCU
+    init_hardware_link()
+
+    # 2. Setup UDP transmission sockets
+    uplink_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    
+    downlink_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        downlink_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        downlink_sock.bind(("0.0.0.0", DOWNLINK_PORT))
+        
+        def downlink_worker():
+            while True:
+                try:
+                    data, _ = downlink_sock.recvfrom(2048)
+                    alert = json.loads(data.decode('utf-8'))
+                    print(f"\n🚨 [SERVER ALERT]: {alert.get('text', 'Obstacle warning')}")
+                except Exception:
+                    time.sleep(0.01)
+                    
+        threading.Thread(target=downlink_worker, daemon=True).start()
+    except Exception as e:
+        print(f"ℹ️ Downlink UDP socket info: {e}. Continuing.")
+
+    # 3. Detect onboard/USB camera
+    cap = detect_camera()
+    last_camera_retry_time = 0
+    last_telemetry_time = 0
+    last_ws_reconnect_time = 0
+
+    # Cross-Network Cloudflare Uplink Client with Autonomous Cloud Sync
+    active_cloud_url = CLOUDFLARE_URL.strip() if (CLOUDFLARE_URL and CLOUDFLARE_URL.strip()) else None
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cache_file = os.path.join(script_dir, "last_known_tunnel_url.txt")
+
+    if not active_cloud_url:
+        print("🔍 [CLOUD SYNC]: Searching for active 5G Edge Server...")
+        discovered = fetch_active_cloud_url(timeout=3.0)
+        if discovered:
+            active_cloud_url = discovered
+            print(f"✨ [CLOUD SYNC LOCKED]: Auto-discovered Edge Server: {active_cloud_url}")
+            try:
+                with open(cache_file, "w") as f:
+                    f.write(active_cloud_url)
+            except Exception:
+                pass
+        elif os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r") as f:
+                    cached = f.read().strip()
+                    if cached.startswith("https://"):
+                        active_cloud_url = cached
+                        print(f"📂 [CLOUD SYNC CACHE]: Using last known URL: {active_cloud_url}")
+            except Exception:
+                pass
+
+    use_cloudflare = bool(active_cloud_url)
+    ws_client = None
+    if use_cloudflare:
+        ws_client = RawWebSocketClient(active_cloud_url)
+        print(f"🌐 [5G CLOUDFLARE MODE]: Connecting to {active_cloud_url}...")
+        ws_client.connect()
+    else:
+        print(f"📡 [LOCAL UDP MODE]: Streaming to {EDGE_SERVER_IP}:{VIDEO_PORT}")
+
+    print("\n🟢 5G Wearable Client running! Press Ctrl+C to terminate.\n")
+
+    try:
+        while True:
+            now = time.time()
+            dist_cm = read_ultrasonic_distance()
+
+            # Auto-reconnect Cloudflare WebSocket if connection drops, or discover on the fly
+            if not ws_client or not ws_client.is_connected:
+                if now - last_ws_reconnect_time >= 4.0:
+                    last_ws_reconnect_time = now
+                    # Check if server announced a URL or changed URL
+                    discovered = fetch_active_cloud_url(timeout=2.0)
+                    if discovered:
+                        current_url = getattr(ws_client, "url", "") if ws_client else ""
+                        if discovered != current_url:
+                            print(f"✨ [CLOUD SYNC]: Linked to Edge Server: {discovered}")
+                            if ws_client:
+                                ws_client.close()
+                            ws_client = RawWebSocketClient(discovered)
+                            use_cloudflare = True
+                            try:
+                                with open(cache_file, "w") as f:
+                                    f.write(discovered)
+                            except Exception:
+                                pass
+                    if ws_client:
+                        ws_client.connect()
+
+            # --- 1. CAMERA STREAMING WITH AUTO-RECONNECT ---
+            if cap is not None and cap.isOpened():
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    # Resize to 480x320 and encode as JPEG (Quality 65) for low latency
+                    frame_resized = cv2.resize(frame, (480, 320))
+                    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 65]
+                    result, encimg = cv2.imencode('.jpg', frame_resized, encode_param)
+                    if result:
+                        payload = encimg.tobytes()
+                        if use_cloudflare and ws_client and ws_client.is_connected:
+                            ws_client.send_binary(payload)
+                        elif not use_cloudflare and len(payload) < 65000:
+                            uplink_sock.sendto(payload, (EDGE_SERVER_IP, VIDEO_PORT))
+                else:
+                    # Camera lost connection
+                    print("⚠️ Camera frame drop. Re-detecting camera...")
+                    cap.release()
+                    cap = None
+            else:
+                # Hot-plug detection: periodically check for newly plugged USB camera
+                if now - last_camera_retry_time >= 3.0:
+                    last_camera_retry_time = now
+                    cap = detect_camera()
+
+            # --- 2. SENSOR TELEMETRY UPLINK (Every 500ms / 2 Hz) ---
+            if now - last_telemetry_time >= 0.5:
+                if use_cloudflare and ws_client and ws_client.is_connected:
+                    telemetry_msg = json.dumps({
+                        "type": "telemetry",
+                        "ultrasonic_cm": dist_cm,
+                        "timestamp": now
+                    })
+                    ws_client.send_text(telemetry_msg)
+                elif not use_cloudflare:
+                    telemetry = {
+                        "ultrasonic_cm": dist_cm,
+                        "timestamp": now
+                    }
+                    payload_json = json.dumps(telemetry).encode('utf-8')
+                    try:
+                        uplink_sock.sendto(payload_json, (EDGE_SERVER_IP, TELEMETRY_PORT))
+                    except Exception:
+                        pass
+
+                last_telemetry_time = now
+                if now - getattr(main, "_last_telemetry_print", 0) >= 2.0:
+                    main._last_telemetry_print = now
+                    dest = f"Cloudflare Tunnel ({'Connected' if (ws_client and ws_client.is_connected) else 'Connecting...'})" if use_cloudflare else f"UDP {EDGE_SERVER_IP}:{TELEMETRY_PORT}"
+                    cam_status = "Online" if (cap is not None and cap.isOpened()) else "Standby (Detecting USB Camera...)"
+                    print(f"📡 [5G Telemetry ➔ {dest}] Distance: {dist_cm:.1f} cm | Camera: {cam_status}", flush=True)
+
+            time.sleep(0.04) # ~25 FPS loop pace
+
+    except KeyboardInterrupt:
+        print("\nStopping Wearable Client...")
+    finally:
+        if ws_client:
+            ws_client.close()
+        if cap is not None:
+            cap.release()
+        uplink_sock.close()
+        downlink_sock.close()
+
+if __name__ == "__main__":
+    main()

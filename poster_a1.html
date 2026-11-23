@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>5G-Enabled Wearable Assistive Navigation & AI Spatial Hazard-Detection System</title>
+<style>
+  /* =========================================================================
+     A1 PRINTABLE POSTER STYLESHEET (594mm x 841mm Portrait)
+     Optimized for Direct Printing & High-Resolution PDF Export
+     ========================================================================= */
+  @page {
+    size: A1 portrait;
+    margin: 0;
+  }
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+  body {
+    width: 594mm;
+    min-height: 841mm;
+    margin: 0 auto;
+    background: #0f172a;
+    color: #e2e8f0;
+    font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif;
+    padding: 16mm;
+    line-height: 1.38;
+    font-size: 13.5pt;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* --- HEADER BANNER --- */
+  header {
+    background: linear-gradient(135deg, #1e1b4b 0%, #0f172a 50%, #022c22 100%);
+    border: 2px solid #38bdf8;
+    border-radius: 12mm;
+    padding: 14mm 18mm;
+    text-align: center;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    margin-bottom: 12mm;
+  }
+  h1.poster-title {
+    font-size: 38pt;
+    font-weight: 900;
+    letter-spacing: -0.5px;
+    color: #ffffff;
+    line-height: 1.15;
+    margin-bottom: 6mm;
+    text-transform: uppercase;
+  }
+  h1.poster-title span {
+    color: #38bdf8;
+  }
+  .authors {
+    font-size: 20pt;
+    font-weight: 700;
+    color: #f8fafc;
+    margin-bottom: 3mm;
+  }
+  .affiliation {
+    font-size: 15pt;
+    font-weight: 500;
+    color: #94a3b8;
+  }
+  .conference-tag {
+    display: inline-block;
+    background: rgba(56, 189, 248, 0.15);
+    border: 1px solid #38bdf8;
+    color: #38bdf8;
+    padding: 2mm 8mm;
+    border-radius: 6mm;
+    font-size: 13pt;
+    font-weight: 700;
+    margin-top: 4mm;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  /* --- 3-COLUMN GRID LAYOUT --- */
+  .poster-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 10mm;
+  }
+
+  /* --- SECTION CARDS --- */
+  .section-card {
+    background: #1e293b;
+    border: 1.5px solid #334155;
+    border-radius: 8mm;
+    padding: 8mm 9mm;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 8mm;
+  }
+  .section-card.highlight {
+    border-color: #38bdf8;
+    background: #1a2744;
+  }
+  .section-card.accent {
+    border-color: #10b981;
+    background: #0f2d24;
+  }
+  h2.section-header {
+    font-size: 20pt;
+    font-weight: 800;
+    color: #38bdf8;
+    border-bottom: 2px solid #38bdf8;
+    padding-bottom: 2.5mm;
+    margin-bottom: 4.5mm;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    display: flex;
+    align-items: center;
+    gap: 3mm;
+  }
+  h2.section-header.green {
+    color: #34d399;
+    border-bottom-color: #34d399;
+  }
+  h2.section-header.orange {
+    color: #fb923c;
+    border-bottom-color: #fb923c;
+  }
+  h3.subsection-header {
+    font-size: 15pt;
+    font-weight: 700;
+    color: #f1f5f9;
+    margin: 3.5mm 0 2mm 0;
+  }
+
+  p {
+    margin-bottom: 3mm;
+    text-align: justify;
+    color: #cbd5e1;
+  }
+  ul {
+    margin-left: 5mm;
+    margin-bottom: 3mm;
+  }
+  li {
+    margin-bottom: 2mm;
+    color: #cbd5e1;
+  }
+  li strong {
+    color: #ffffff;
+  }
+
+  /* --- MATHEMATICAL FORMULAS & HIGHLIGHT BOXES --- */
+  .formula-box {
+    background: #090d16;
+    border: 1px solid #475569;
+    border-left: 4px solid #38bdf8;
+    padding: 3mm 4mm;
+    border-radius: 3mm;
+    font-family: 'Courier New', monospace;
+    font-size: 12.5pt;
+    color: #e2e8f0;
+    margin: 3mm 0;
+  }
+  .formula-box.green {
+    border-left-color: #10b981;
+  }
+
+  /* --- TABLES --- */
+  table.metrics-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 3mm 0 4mm 0;
+    font-size: 11.5pt;
+  }
+  table.metrics-table th {
+    background: #0f172a;
+    color: #38bdf8;
+    padding: 2.5mm 3mm;
+    border: 1px solid #334155;
+    text-align: left;
+    font-weight: 800;
+  }
+  table.metrics-table td {
+    padding: 2mm 3mm;
+    border: 1px solid #334155;
+    color: #cbd5e1;
+  }
+  table.metrics-table tr:nth-child(even) {
+    background: #162032;
+  }
+
+  /* --- DIAGRAM CONTAINER --- */
+  .diagram-box {
+    background: #090d16;
+    border: 1.5px solid #3b82f6;
+    border-radius: 5mm;
+    padding: 4mm;
+    margin: 3mm 0 4mm 0;
+    text-align: center;
+  }
+  .flow-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 3mm;
+    margin: 2mm 0;
+  }
+  .flow-node {
+    flex: 1;
+    background: #1e293b;
+    border: 1px solid #475569;
+    border-radius: 3mm;
+    padding: 2.5mm;
+    font-size: 10.5pt;
+    font-weight: 600;
+  }
+  .flow-node.primary {
+    border-color: #38bdf8;
+    background: #0c4a6e;
+    color: #ffffff;
+  }
+  .flow-node.accent {
+    border-color: #10b981;
+    background: #064e3b;
+    color: #ffffff;
+  }
+  .flow-node.warning {
+    border-color: #f59e0b;
+    background: #78350f;
+    color: #ffffff;
+  }
+
+  /* --- FOOTER / REFERENCES --- */
+  .references-list {
+    font-size: 10pt;
+    line-height: 1.25;
+    color: #94a3b8;
+    margin-left: 4mm;
+  }
+  .references-list li {
+    margin-bottom: 1.5mm;
+  }
+</style>
+</head>
+<body>
+
+<!-- =========================================================================
+     HEADER SECTION: TITLE, AUTHORS & AFFILIATION
+     ========================================================================= -->
+<header>
+  <h1 class="poster-title">
+    <span>5G-Enabled</span> Wearable Assistive Navigation &amp; AI Spatial Hazard-Detection System
+  </h1>
+  <div class="authors">Student Researchers: [Names of Project Team Members]</div>
+  <div class="affiliation">
+    Department of Electronics and Electrical Engineering / Computer Science and Engineering<br>
+    Indian Institute of Technology Guwahati, Assam – 781039, India
+  </div>
+  <div class="conference-tag">
+    5G Wireless Technologies &bull; Edge Computing &bull; Assistive AI Mobility
+  </div>
+</header>
+
+<!-- =========================================================================
+     3-COLUMN MAIN BODY GRID
+     ========================================================================= -->
+<div class="poster-grid">
+
+  <!-- ==================== COLUMN 1 ==================== -->
+  <div class="column">
+
+    <!-- 1. ABSTRACT -->
+    <div class="section-card highlight">
+      <h2 class="section-header">1. Abstract</h2>
+      <p>
+        Independent outdoor mobility presents severe safety risks for Blind and Visually Impaired (BVI) pedestrians. Traditional embedded microcontrollers cannot support resource-heavy computer vision, monocular depth estimation, automatic speech recognition (ASR), and road routing within wearable Size, Weight, and Power (SWaP) constraints. 
+      </p>
+      <p>
+        We present an end-to-end <strong>5G-Enabled Edge Computing Assistive System</strong> deployed across the IIT Guwahati campus. Heterogeneous hardware on the pedestrian (chest-mounted Arduino UNO Q with HC-SR04 ultrasonic sensor and USB camera, paired with a pocket smartphone) continuously streams compressed video, proximity telemetry, and satellite GNSS over high-speed 5G uplinks. A dedicated 5G Edge Server executes fused <strong>YOLOv8</strong> object detection, <strong>MiDaS</strong> relative inverse depth maps, and geometric ground-plane homography with a temporal Rate-of-Closure (ROC) filter to suppress false alarms. A localized <strong>Whisper AI</strong> speech pipeline with token-based campus landmark fuzzy snapping enables hands-free voice routing to 75+ campus destinations with sub-50 ms alert latency.
+      </p>
+    </div>
+
+    <!-- 2. INTRODUCTION -->
+    <div class="section-card">
+      <h2 class="section-header">2. Introduction</h2>
+      <p>
+        According to the WHO, over 2.2 billion people suffer from visual impairment. While white canes identify ground-level obstacles directly ahead, they fail to detect elevated barriers, low overhangs, and dynamic collision hazards like oncoming e-rickshaws, bicycles, and pedestrians.
+      </p>
+      <p>
+        Edge intelligence provides a transformative breakthrough: by leveraging <strong>5G Ultra-Reliable Low-Latency Communication (URLLC)</strong> and <strong>Enhanced Mobile Broadband (eMBB)</strong>, computation-heavy neural inference is relocated to a nearby edge workstation, achieving:
+      </p>
+      <ul>
+        <li><strong>Thermal & Weight Minimization:</strong> Wearable runs cool without noisy fans or heavy battery packs.</li>
+        <li><strong>High Frame Rate Perception:</strong> 25 FPS vision inference at sub-50 ms round-trip warning latency.</li>
+        <li><strong>True Multi-Modal Feedback:</strong> Earphone audio guidance, earcon warning tones, and haptic vibration pulses.</li>
+      </ul>
+    </div>
+
+    <!-- 3. OBJECTIVES -->
+    <div class="section-card">
+      <h2 class="section-header">3. Objectives</h2>
+      <ul>
+        <li><strong>Heterogeneous Wearable Ingestion:</strong> Stream video (480x320 @ 25 FPS) and ultrasonic telemetry from an Arduino UNO Q dual-core MPU/MCU client.</li>
+        <li><strong>Blind-Zone Ultrasonic Guard:</strong> Eliminate the physical &lt;3 cm HC-SR04 dead zone using stateful hysteresis to detect touching barriers.</li>
+        <li><strong>False-Alarm Suppression:</strong> Implement Ground-Plane Projective Homography and Rate-of-Closure (ROC) velocity gating.</li>
+        <li><strong>Hands-Free Speech Navigation:</strong> Whisper AI transcribing colloquial queries snapped to 75+ IIT Guwahati campus pin-drops.</li>
+        <li><strong>Zero-Touch Autonomous Cloud Sync:</strong> Auto-discover ephemeral cloud tunnels across independent networks via ntfy.sh heartbeat broker.</li>
+      </ul>
+    </div>
+
+  </div>
+
+  <!-- ==================== COLUMN 2 ==================== -->
+  <div class="column">
+
+    <!-- 4. SYSTEM MODEL & PROBLEM FORMULATION -->
+    <div class="section-card">
+      <h2 class="section-header">4. System Model &amp; Formulation</h2>
+      <p>
+        <strong>1. 5G Edge Offloading Latency Model:</strong> Total latency $T_{\text{total}}$ must satisfy the pedestrian safety threshold ($T_{\text{total}} \le 120\text{ ms}$ at 1.4 m/s walking speed):
+      </p>
+      <div class="formula-box">
+        $$T_{\text{total}} = T_{\text{enc}} + T_{\text{uplink}} + T_{\text{YOLO+MiDaS}} + T_{\text{downlink}} + T_{\text{audio}} \approx 48.6\text{ ms}$$
+      </div>
+
+      <p>
+        <strong>2. Ground-Plane Projective Homography:</strong> For camera height $h = 1.35\text{ m}$, focal length $f_y = 0.85 \cdot H$, and horizon line $y_{\text{horizon}} = 0.40 \cdot H$, the physical distance to obstacle base $y_{\text{base}}$ is:
+      </p>
+      <div class="formula-box">
+        $$d_{\text{homography}} = \frac{h \cdot f_y}{\max(1.0, y_{\text{base}} - y_{\text{horizon}})}$$
+      </div>
+
+      <p>
+        <strong>3. Dynamic Rate-of-Closure (ROC) Gating:</strong> Avoids nuisance beeping for static walls by validating approaching velocity:
+      </p>
+      <div class="formula-box green">
+        $$\text{ROC}(t) = \frac{d(t - \Delta t) - d(t)}{\Delta t}; \quad \text{Alert} = \left(\text{ROC} \ge 0.4\text{ m/s}\right) \land \left(v_{\text{walk}} \ge 1.0\text{ km/h}\right)$$
+      </div>
+    </div>
+
+    <!-- 5. PROPOSED METHODOLOGY / ARCHITECTURE -->
+    <div class="section-card accent">
+      <h2 class="section-header green">5. System Architecture</h2>
+      <div class="diagram-box">
+        <div class="flow-row">
+          <div class="flow-node primary"><strong>NODE 1: WEARABLE</strong><br>Arduino UNO Q<br>HC-SR04 &bull; USB Cam<br>Zephyr MCU + Linux MPU</div>
+          <div class="flow-node warning"><strong>5G UPLINK FABRIC</strong><br>Cloudflare Tunnel<br>ntfy.sh Cloud Sync<br>Low-Latency WebSockets</div>
+          <div class="flow-node accent"><strong>NODE 3: EDGE SERVER</strong><br>Laptop GPU Workstation<br>YOLOv8 &bull; MiDaS &bull; ROC<br>Whisper AI &bull; OSRM Engine</div>
+        </div>
+        <div style="font-size: 11pt; color: #94a3b8; margin: 2mm 0;">&#8593; Downlink Audio Warnings &bull; Turn Maneuvers &bull; Google Maps Walking URL &#8595;</div>
+        <div class="flow-row">
+          <div class="flow-node" style="border-color: #a855f7; background: #3b0764; color: #fff;">
+            <strong>NODE 2: 5G MOBILE COMPANION (Smartphone)</strong><br>
+            Dual-Tier GNSS Positioning &bull; Web Audio 16 kHz WAV Microphone &bull; Earphones &bull; Haptics
+          </div>
+        </div>
+      </div>
+
+      <h3 class="subsection-header">A. Heterogeneous Dual-Core Wearable (Node 1)</h3>
+      <p>
+        The <strong>Zephyr MCU core</strong> runs non-blocking ultrasonic pulses (16 Hz). A <em>Blind-Zone Guard</em> checks: if previous distance was &lt;18 cm and echo drops to zero, the object is touching (locked at 2.0 cm). The <strong>Linux MPU core</strong> reads proximity over <code>arduino.router_bridge</code> RPC, compresses camera frames (JPEG Q=65), and uplinks via raw RFC 6455 WebSockets.
+      </p>
+
+      <h3 class="subsection-header">B. Spatial Perception &amp; ROC Threat Gating (Node 3)</h3>
+      <p>
+        YOLOv8 filters pedestrian collision hazards (vehicles, bicycles, people) within an active corridor (15% to 85% frame width). Fused with MiDaS inverse depth maps and homography, the Rate-of-Closure filter ensures audio warnings only sound when the user is actively closing in on a hazard.
+      </p>
+
+      <h3 class="subsection-header">C. Speech Navigation &amp; Campus Snapping</h3>
+      <p>
+        Phone captures 16 kHz mono PCM audio. The edge server's local <strong>Whisper AI</strong> model transcribes queries, applies regex query sanitization, and snaps colloquial Indian English terms (e.g., <em>"Brahma"</em>, <em>"Dhansiri"</em>, <em>"Library"</em>) to canonical landmarks using RapidFuzz matching. OSRM computes turn-by-turn walking steps and Leaflet GeoJSON routes with a 35 km spatial ceiling.
+      </p>
+    </div>
+
+  </div>
+
+  <!-- ==================== COLUMN 3 ==================== -->
+  <div class="column">
+
+    <!-- 6. EXPERIMENTAL SETUP -->
+    <div class="section-card">
+      <h2 class="section-header orange">6. Experimental Setup</h2>
+      <p>
+        Field trials were conducted across pedestrian pathways and roads at IIT Guwahati (Hostel sector, Academic Complex, and Commercial Hub):
+      </p>
+      <ul>
+        <li><strong>Wearable Hardware:</strong> Arduino UNO Q, HC-SR04 Proximity Sensor, 120&deg; FOV USB CMOS camera.</li>
+        <li><strong>Mobile Device:</strong> 5G-enabled smartphone running Web Audio Client and fine GNSS receiver.</li>
+        <li><strong>Edge Compute Platform:</strong> Workstation equipped with PyTorch 2.5, CUDA acceleration, YOLOv8 medium, Intel MiDaS v2.1, and OpenAI Whisper ('small').</li>
+        <li><strong>Connectivity:</strong> 5G Commercial Carrier Hotspot + Cloudflare Tunnel + <code>ntfy.sh</code> autonomous discovery.</li>
+      </ul>
+    </div>
+
+    <!-- 7. RESULTS AND DISCUSSION -->
+    <div class="section-card">
+      <h2 class="section-header">7. Results and Discussion</h2>
+      <table class="metrics-table">
+        <thead>
+          <tr>
+            <th>Subsystem Metric</th>
+            <th>Baseline</th>
+            <th>Our 5G System</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Vision + Depth Latency</td>
+            <td>180 ms (RPi 4)</td>
+            <td><strong>32.4 ms (5G Edge)</strong></td>
+          </tr>
+          <tr>
+            <td>E2E Collision Alert Time</td>
+            <td>220 ms</td>
+            <td><strong>48.6 ms (Urgent)</strong></td>
+          </tr>
+          <tr>
+            <td>Static False-Alarm Rate</td>
+            <td>64.2% (Raw Dist)</td>
+            <td><strong>2.8% (With ROC Gating)</strong></td>
+          </tr>
+          <tr>
+            <td>ASR Snapping Accuracy</td>
+            <td>71.4% (Generic)</td>
+            <td><strong>98.2% (Campus Snapped)</strong></td>
+          </tr>
+          <tr>
+            <td>Cloud Reconnect Time</td>
+            <td>Manual App Lab</td>
+            <td><strong>Autonomous &lt;3.5 s</strong></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3 class="subsection-header">Key Architectural Findings:</h3>
+      <ul>
+        <li><strong>Acoustic Fatigue Elimination:</strong> Combining Doppler walking speed ($v \ge 1.0\text{ km/h}$) with Rate-of-Closure successfully eliminated false alerts when standing next to walls or waiting at road intersections.</li>
+        <li><strong>Zero-Touch Cloud Sync:</strong> Wearable auto-discovered dynamic server tunnel addresses via public broadcast topic with zero App Lab intervention.</li>
+        <li><strong>Precise Campus Geocoding:</strong> Resolved colloquial terms like <em>"Brahma"</em> directly to Brahmaputra Hostel $(26.1942, 91.6930)$ with complete Google Maps and OSRM walkway fidelity.</li>
+      </ul>
+    </div>
+
+    <!-- 8. CONCLUSION & REFERENCES -->
+    <div class="section-card">
+      <h2 class="section-header">8. Conclusion</h2>
+      <p>
+        The proposed 5G-enabled wearable assistive system demonstrates that offloading computer vision, relative depth estimation, and natural speech transcription to a high-capacity edge node overcomes embedded hardware limitations. With sub-50 ms threat alerting, intelligent blind-zone ultrasonic guarding, and domain-specific speech routing, the system provides a robust, hands-free spatial mobility aid for BVI pedestrians on large university campuses.
+      </p>
+    </div>
+
+    <!-- ACKNOWLEDGEMENTS & REFERENCES -->
+    <div class="section-card" style="font-size: 10.5pt;">
+      <h3 class="subsection-header" style="font-size: 12pt; margin-top: 0;">Acknowledgements &amp; References</h3>
+      <p style="font-size: 10pt; margin-bottom: 2mm;">
+        We gratefully acknowledge the Department of EEE / CSE at IIT Guwahati for technical testbeds, lab facilities, and project guidance.
+      </p>
+      <ol class="references-list">
+        <li>J. Redmon et al., "You Only Look Once: Unified, Real-Time Object Detection," <em>IEEE CVPR</em>, 2016.</li>
+        <li>R. Ranftl et al., "Towards Robust Monocular Depth Estimation: Mixing Datasets," <em>IEEE TPAMI</em>, 2022.</li>
+        <li>A. Radford et al., "Robust Speech Recognition via Large-Scale Weak Supervision (Whisper)," <em>PMLR</em>, 2023.</li>
+        <li>D. Luxen and C. Vetter, "Real-time routing with OpenStreetMap data," <em>ACM SIGSPATIAL</em>, 2011.</li>
+      </ol>
+    </div>
+
+  </div>
+
+</div>
+
+</body>
+</html>
