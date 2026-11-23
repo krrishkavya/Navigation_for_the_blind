@@ -14,6 +14,7 @@ from .campus_snapping import snap_to_campus_landmark, get_search_terms_for_landm
 from .speech_to_text import get_voice_command, transcribe_audio_np, decode_audio_to_np, get_whisper_model, clean_destination_query
 from .text_to_speech import speak_text
 from .location_service import get_live_location
+from .route_optimizer import route_cost, remaining_cost, is_clearly_better
 
 __all__ = [
     'get_detailed_route',
@@ -29,5 +30,8 @@ __all__ = [
     'get_whisper_model',
     'clean_destination_query',
     'speak_text',
-    'get_live_location'
+    'get_live_location',
+    'route_cost',
+    'remaining_cost',
+    'is_clearly_better'
 ]

@@ -16,6 +16,7 @@ import json
 import copy
 import threading
 import collections
+import math
 import cv2
 import numpy as np
 
@@ -41,6 +42,7 @@ from vision import (
     YoloDetector,
     DepthEstimator,
     MotionDetector,
+    ThreatTracker,
     draw_navigation_hud,
     draw_threat_boxes,
     draw_qr_overlay
@@ -55,22 +57,25 @@ from navigation import (
     get_whisper_model,
     speak_text,
     get_live_location,
-    haversine_distance_km
+    haversine_distance_km,
+    route_cost,
+    remaining_cost,
+    is_clearly_better
 )
 
 # File paths
 MAP_HTML_PATH = os.path.join(current_dir, "live_map.html")
 NAV_STATE_PATH = os.path.join(current_dir, "navigation_state.json")
 
-# Real-world pedestrian collision hazard classes
-PEDESTRIAN_COLLISION_CLASSES = {
-    'person', 'bicycle', 'car', 'motorcycle', 'bus', 'truck',
-    'traffic light', 'fire hydrant', 'stop sign', 'bench',
-    'chair', 'couch', 'potted plant', 'bed', 'dining table',
-    'table', 'toilet', 'tv', 'laptop', 'refrigerator', 'bottle',
-    'dog', 'horse', 'cow', 'suitcase', 'backpack', 'umbrella',
-    'trash can', 'pole', 'stairs', 'barrier', 'door', 'hazard', 'obstacle'
+# Real-world pedestrian collision hazard classes and threat priorities (COCO classes)
+HAZARD_PRIORITY = {   # higher = more dangerous
+    'car': 3, 'bus': 3, 'truck': 3, 'motorcycle': 3, 'bicycle': 3, 'train': 3,
+    'person': 2, 'dog': 2, 'horse': 2, 'cow': 2,
+    'bench': 1, 'chair': 1, 'couch': 1, 'potted plant': 1, 'dining table': 1, 'bed': 1,
+    'fire hydrant': 1, 'stop sign': 1, 'parking meter': 1, 'suitcase': 1,
+    'refrigerator': 1, 'tv': 1, 'toilet': 1
 }
+PEDESTRIAN_COLLISION_CLASSES = set(HAZARD_PRIORITY)   # existing name kept, so other code is unaffected
 
 # Global navigation state and synchronization locks
 nav_lock = threading.RLock()
@@ -103,6 +108,14 @@ nav_state = {
     "last_weak_gps_warn": 0.0,
     "last_restored_gps_warn": 0.0,
     "phone_disconnect_time": None,
+    "approach_prev_gap": 0.0,
+    "approach_away_count": 0,
+    "last_approach_hint": 0.0,
+    "route_peak_idx": 0,
+    "backtrack_count": 0,
+    "last_backtrack_warn": 0.0,
+    "last_any_guidance": 0.0,
+    "last_dist_to_target_m": None,
     "last_updated": time.time()
 }
 
@@ -134,10 +147,10 @@ def load_nav_config():
     defaults = {
         "step_length_m": 0.7,
         "quiet_period_sec": 1.5,
-        "off_route_min_distance_m": 20.0,
+        "off_route_min_distance_m": 35.0,
         "off_route_accuracy_multiplier": 1.5,
-        "off_route_readings_threshold": 5,
-        "wrong_dir_readings_threshold": 5,
+        "off_route_readings_threshold": 8,
+        "wrong_dir_readings_threshold": 3,
         "turn_execution_radius_min_m": 5.0,
         "turn_execution_radius_max_m": 10.0,
         "turn_execution_closeness_m": 15.0,
@@ -156,11 +169,33 @@ def load_nav_config():
         "step_advance_cooldown_sec": 3.0,
         "pre_turn_audio_cooldown_sec": 8.0,
         "reroute_cooldown_sec": 20.0,
-        "wrong_dir_cooldown_sec": 20.0,
+        "wrong_dir_cooldown_sec": 12.0,
         "corridor_catchup_points_ahead": 6,
         "passed_min_dist_m": 12.0,
         "ultra_contact_distance_cm": 25.0,
-        "ultra_critical_distance_cm": 50.0
+        "ultra_critical_distance_cm": 50.0,
+        "laptop_speaks_alerts": True,
+        "depth_on_demand": True,
+        "ttc_alerts_enabled": True,
+        "ttc_warning_s": 3.0,
+        "ttc_critical_s": 1.5,
+        "vision_immediate_m": 1.0,
+        "approach_gap_m": 25.0,
+        "reopt_enabled": False,
+        "max_silence_sec": 30,
+        "reopt_timer_sec": 150,
+        "reopt_min_interval_sec": 45,
+        "reopt_switch_cooldown_sec": 120,
+        "reopt_no_switch_near_turn_m": 30,
+        "reopt_min_gain_m": 30,
+        "reopt_min_gain_pct": 0.15,
+        "vision_min_hits": 3,
+        "path_half_width_m": 0.75,
+        "cam_focal_frac_x": 0.9,
+        "depth_fusion_weight": 0.0,
+        "cam_height_m": 1.25,
+        "cam_focal_frac_y": 0.85,
+        "cam_horizon_frac": 0.40
     }
     if os.path.exists(NAV_CONFIG_PATH):
         try:
@@ -186,6 +221,7 @@ def announce_guidance(text, mobile_bridge=None, async_mode=True, priority="norma
     - If MOBILE_AUDIO_ONLY is True and mobile phone is connected: Mutes laptop speakers for clean earphone operation.
     - If no phone client is connected: Speaks via laptop speakers (fallback for local workstation testing or standalone wearable).
     """
+    nav_state["last_any_guidance"] = time.time()
     has_phone = (mobile_bridge is not None and hasattr(mobile_bridge, 'has_phone_clients') and mobile_bridge.has_phone_clients())
     if has_phone:
         print(f"🎧 [AUDIO -> 5G EARPHONES ({priority.upper()})]: \"{text}\"")
@@ -224,13 +260,33 @@ def densify_polyline(points, step_m=5.0):
     out = [points[0]]
     for a, b in zip(points, points[1:]):
         d = haversine_distance_km((a[0], a[1]), (b[0], b[1])) * 1000.0
-        n = max(1, int(d // step_m))
+        n = max(1, math.ceil(d / step_m))
         for i in range(1, n + 1):
             t = i / float(n)
             out.append([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t])
     return out
 
-def handle_voice_navigation(network, mobile_bridge=None, direct_destination=None, is_exact=False):
+def reopt_check(network, mobile_bridge, gps, rid):
+    """Periodically evaluates whether a substantially shorter route exists."""
+    try:
+        res = get_detailed_route(gps, nav_state["destination_name"])
+        if not res.get("success") or nav_state.get("route_id") != rid:
+            return
+        pts = res.get("route_points") or []
+        if pts and haversine_distance_km(gps, pts[0]) * 1000.0 > NAV_CONFIG.get("approach_gap_m", 25.0):
+            return
+        new_c = route_cost(res.get("structured_steps", []), res["total_distance_m"])
+        old_c = remaining_cost(nav_state)
+        if is_clearly_better(new_c, old_c, NAV_CONFIG.get("reopt_min_gain_m", 30.0), NAV_CONFIG.get("reopt_min_gain_pct", 0.15)):
+            nav_state["last_route_switch"] = time.time()
+            handle_voice_navigation(network, mobile_bridge, nav_state["destination_name"], True, res, "optimize")
+    except Exception as e:
+        print(f"⚠️ [REOPT SKIPPED]: {e}")
+    finally:
+        nav_state["reopt_running"] = False
+
+def handle_voice_navigation(network, mobile_bridge=None, direct_destination=None,
+                            is_exact=False, precomputed_route=None, quiet_reason=None):
     """
     Asynchronous voice navigation handler.
     Runs on a background worker thread so real-time camera inference never pauses.
@@ -238,18 +294,22 @@ def handle_voice_navigation(network, mobile_bridge=None, direct_destination=None
     global is_listening_nav, is_mic_capturing, nav_state
     
     with nav_lock:
-        if is_listening_nav and not direct_destination:
+        if is_listening_nav and not direct_destination and not precomputed_route:
             print("⏳ Voice Navigation is currently active. Please speak your destination...")
             return
         is_listening_nav = True
 
     try:
-        if direct_destination:
+        if precomputed_route:
+            destination = target_dest = direct_destination or precomputed_route.get("destination_name")
+            needs_confirm = False
+        elif direct_destination:
             destination_raw = str(direct_destination).strip()
             print(f"\n🎙️  [IPHONE 5G VOICE COMMAND]: '{destination_raw}'")
             cleaned = clean_destination_query(destination_raw)
             snapped, conf, corrected = snap_to_campus_landmark(cleaned)
             target_dest = snapped if snapped else (cleaned or destination_raw)
+            needs_confirm = not is_exact
         else:
             nav_state["current_step"] = "🎙️ Listening for destination..."
             sync_navigation_state_file()
@@ -275,10 +335,9 @@ def handle_voice_navigation(network, mobile_bridge=None, direct_destination=None
             cleaned = clean_destination_query(destination_raw)
             snapped, conf, corrected = snap_to_campus_landmark(cleaned)
             target_dest = snapped if snapped else (cleaned or destination_raw)
-            is_exact = False  # Laptop mic is spoken, so it must confirm
+            needs_confirm = True
 
         # Bug 3: Spoken destinations require double-tap confirmation; typed entries (is_exact=True) skip
-        needs_confirm = not is_exact
         if needs_confirm:
             if mobile_bridge:
                 mobile_bridge.pop_destination_confirmation()  # Clear any old double-tap
@@ -304,65 +363,71 @@ def handle_voice_navigation(network, mobile_bridge=None, direct_destination=None
 
         nav_state["current_step"] = f"🧭 Routing to: {destination}"
         sync_navigation_state_file()
-        announce_guidance(f"Calculating walking route to {destination}...", mobile_bridge=mobile_bridge, async_mode=False)
+        if quiet_reason not in ("optimize", "offroute"):
+            announce_guidance(f"Calculating walking route to {destination}...", mobile_bridge=mobile_bridge, async_mode=False)
         
         # 1. Determine Starting Location with GPS Quality Verification (Bug 9)
-        server_ip = UDPNetworkHandler.get_local_ip()
-        gps_tuple, gps_source, gps_age = (None, None, 999.0)
-        current_acc = 999.0
-        if mobile_bridge:
-            gps_tuple, gps_source, gps_age = mobile_bridge.get_latest_gps_with_metadata()
-            current_acc = mobile_bridge.get_latest_accuracy()
-        if not gps_tuple or gps_age >= 10.0 or current_acc > 30.0:
-            if network:
-                n_tuple, n_src, n_age = network.get_latest_gps_with_metadata()
-                if n_tuple and n_age < 10.0:
-                    gps_tuple, gps_source, gps_age = n_tuple, n_src, n_age
-                    current_acc = 15.0
-
-        is_preset = (gps_source in ("preset", "manual"))
-        is_gps_valid = is_preset or (gps_tuple and gps_age < 10.0 and current_acc <= 30.0)
-
-        # Retry up to 10 seconds if GPS is settling (Bug 9)
-        if not is_gps_valid and not is_preset:
-            announce_guidance("Getting your location, please wait.", mobile_bridge=mobile_bridge, async_mode=False)
-            t_start = time.time()
-            while (time.time() - t_start) < 10.0:
-                time.sleep(1.0)
-                if mobile_bridge:
-                    gps_tuple, gps_source, gps_age = mobile_bridge.get_latest_gps_with_metadata()
-                    current_acc = mobile_bridge.get_latest_accuracy()
-                    if gps_tuple and gps_age < 10.0 and current_acc <= 30.0:
-                        is_gps_valid = True
-                        break
-
-        if is_gps_valid and gps_tuple:
-            current_gps = gps_tuple
-            mode_label = "5G REMOTE SATELLITE" if gps_source in ("live", "live_watch", "network", "iphone_5g") else ("CAMPUS PRESET" if is_preset else "LIVE SATELLITE")
-            nav_state["gps_mode"] = mode_label
-            print("\n" + "="*58)
-            print(f"🛰️  [LOCATION SOURCE: {mode_label} GPS (±{current_acc:.1f}m)]")
-            print(f"📍 Active Coordinates : ({current_gps[0]:.5f}, {current_gps[1]:.5f})")
-            print(f"⏱️  Satellite Fix Age  : {gps_age:.1f}s ago")
-            print("="*58 + "\n")
+        if precomputed_route:
+            current_gps = precomputed_route.get("start_coords") or get_live_location()
+            current_acc = mobile_bridge.get_latest_accuracy() if mobile_bridge else 5.0
+            route_res = precomputed_route
         else:
-            current_gps = get_live_location()
-            nav_state["gps_mode"] = "FALLBACK"
-            reason = f"GPS degraded (Acc: ±{current_acc:.1f}m, Age: {gps_age:.1f}s)" if gps_tuple else "No live GPS packets received yet"
-            print("\n" + "="*58)
-            print("⚠️  [LOCATION SOURCE: FALLBACK LOCATION]")
-            print(f"📍 Active Coordinates : ({current_gps[0]:.5f}, {current_gps[1]:.5f})")
-            print(f"ℹ️  Fallback Reason    : {reason}")
-            print(f"👉 Target in iPhone App: Host {server_ip}, Port 5006 (UDP) or 5G Web Link")
-            print("="*58 + "\n")
-            if not is_preset:
-                announce_guidance("I can't find your location. Please move to an open area and try again.", mobile_bridge=mobile_bridge)
-                nav_state["current_step"] = "⚠️ Location unavailable. Please move to an open area."
-                sync_navigation_state_file()
-                return
-            
-        # 2. Compute Complete Navigation Route & Map Geometry
-        route_res = get_detailed_route(current_gps, destination)
+            server_ip = UDPNetworkHandler.get_local_ip()
+            gps_tuple, gps_source, gps_age = (None, None, 999.0)
+            current_acc = 999.0
+            if mobile_bridge:
+                gps_tuple, gps_source, gps_age = mobile_bridge.get_latest_gps_with_metadata()
+                current_acc = mobile_bridge.get_latest_accuracy()
+            if not gps_tuple or gps_age >= 10.0 or current_acc > 30.0:
+                if network:
+                    n_tuple, n_src, n_age = network.get_latest_gps_with_metadata()
+                    if n_tuple and n_age < 10.0:
+                        gps_tuple, gps_source, gps_age = n_tuple, n_src, n_age
+                        current_acc = 15.0
+
+            is_preset = (gps_source in ("preset", "manual"))
+            is_gps_valid = is_preset or (gps_tuple and gps_age < 10.0 and current_acc <= 30.0)
+
+            # Retry up to 10 seconds if GPS is settling (Bug 9)
+            if not is_gps_valid and not is_preset:
+                announce_guidance("Getting your location, please wait.", mobile_bridge=mobile_bridge, async_mode=False)
+                t_start = time.time()
+                while (time.time() - t_start) < 10.0:
+                    time.sleep(1.0)
+                    if mobile_bridge:
+                        gps_tuple, gps_source, gps_age = mobile_bridge.get_latest_gps_with_metadata()
+                        current_acc = mobile_bridge.get_latest_accuracy()
+                        if gps_tuple and gps_age < 10.0 and current_acc <= 30.0:
+                            is_gps_valid = True
+                            break
+
+            if is_gps_valid and gps_tuple:
+                current_gps = gps_tuple
+                mode_label = "5G REMOTE SATELLITE" if gps_source in ("live", "live_watch", "network", "iphone_5g") else ("CAMPUS PRESET" if is_preset else "LIVE SATELLITE")
+                nav_state["gps_mode"] = mode_label
+                print("\n" + "="*58)
+                print(f"🛰️  [LOCATION SOURCE: {mode_label} GPS (±{current_acc:.1f}m)]")
+                print(f"📍 Active Coordinates : ({current_gps[0]:.5f}, {current_gps[1]:.5f})")
+                print(f"⏱️  Satellite Fix Age  : {gps_age:.1f}s ago")
+                print("="*58 + "\n")
+            else:
+                current_gps = get_live_location()
+                nav_state["gps_mode"] = "FALLBACK"
+                reason = f"GPS degraded (Acc: ±{current_acc:.1f}m, Age: {gps_age:.1f}s)" if gps_tuple else "No live GPS packets received yet"
+                print("\n" + "="*58)
+                print("⚠️  [LOCATION SOURCE: FALLBACK LOCATION]")
+                print(f"📍 Active Coordinates : ({current_gps[0]:.5f}, {current_gps[1]:.5f})")
+                print(f"ℹ️  Fallback Reason    : {reason}")
+                print(f"👉 Target in iPhone App: Host {server_ip}, Port 5006 (UDP) or 5G Web Link")
+                print("="*58 + "\n")
+                if not is_preset:
+                    announce_guidance("I can't find your location. Please move to an open area and try again.", mobile_bridge=mobile_bridge)
+                    nav_state["current_step"] = "⚠️ Location unavailable. Please move to an open area."
+                    sync_navigation_state_file()
+                    return
+                
+            # 2. Compute Complete Navigation Route & Map Geometry
+            route_res = get_detailed_route(current_gps, destination)
         
         if route_res["success"] and len(route_res.get("steps", [])) > 0:
             steps_list = route_res.get("steps", [])
@@ -395,6 +460,9 @@ def handle_voice_navigation(network, mobile_bridge=None, direct_destination=None
                 else:
                     step_obj["route_idx"] = start_search_idx
 
+            # Approach phase check (Group C2)
+            gap_to_path_m = haversine_distance_km(current_gps, r_points[0]) * 1000.0 if r_points else 0.0
+
             # Update Global Navigation State (Thread-safe with route_id tracking to prevent race conditions)
             with nav_lock:
                 nav_state["is_active"] = True
@@ -423,9 +491,19 @@ def handle_voice_navigation(network, mobile_bridge=None, direct_destination=None
                 nav_state["arrive_count"] = 0
                 nav_state["off_route_count"] = 0
                 nav_state["wrong_dir_count"] = 0
-                nav_state["orienting"] = True
+                nav_state["approach_phase"] = (gap_to_path_m > NAV_CONFIG.get("approach_gap_m", 25.0)) if quiet_reason != "optimize" else False
+                nav_state["approach_start"] = time.time()
+                nav_state["approach_prev_gap"] = gap_to_path_m
+                nav_state["approach_away_count"] = 0
+                nav_state["last_approach_hint"] = 0.0
+                nav_state["orienting"] = (quiet_reason != "optimize") and not nav_state["approach_phase"]
                 nav_state["orient_start"] = time.time()
                 nav_state["last_orient_hint"] = 0.0
+                nav_state["route_peak_idx"] = 0
+                nav_state["backtrack_count"] = 0
+                nav_state["last_backtrack_warn"] = 0.0
+                nav_state["last_any_guidance"] = time.time()
+                nav_state["last_dist_to_target_m"] = None
                 nav_state["post_turn_checked"] = False
                 nav_state["last_reroute"] = 0.0
                 nav_state["last_wrong_dir_warn"] = 0.0
@@ -433,21 +511,22 @@ def handle_voice_navigation(network, mobile_bridge=None, direct_destination=None
                 nav_state["last_milestone_announced"] = 99999
                 nav_state["last_progress_announce_time"] = time.time()
                 nav_state["gps_buf"] = []
-                nav_state["gps_was_weak"] = False
+                if quiet_reason != "optimize":
+                    nav_state["gps_was_weak"] = False
                 nav_state["good_gps_start_time"] = None
                 nav_state["last_weak_gps_warn"] = 0.0
                 nav_state["last_restored_gps_warn"] = 0.0
                 nav_state["phone_disconnect_time"] = None
+                nav_state["start_acc"] = current_acc
+                nav_state["reopt_gps_done"] = False
+                nav_state["reopt_running"] = False
                 nav_state["last_updated"] = time.time()
 
             # Construct direct Universal Google Maps walking navigation URL
-            # Omitting 'origin' allows Google Maps to bind directly to the phone's live GPS hardware and auto-start turn-by-turn navigation
             start_lat, start_lon = current_gps
             dest_coords = route_res.get("end_coords") or route_res.get("dest_coords") or (26.1928, 91.6985)
             dest_lat, dest_lon = dest_coords
             google_maps_url = f"https://www.google.com/maps/dir/?api=1&destination={dest_lat:.6f},{dest_lon:.6f}&travelmode=walking&dir_action=navigate"
-            # [FALLBACK PREVIEW MODE]: Uncomment below if explicit start coords are needed for static itinerary preview
-            # google_maps_url = f"https://www.google.com/maps/dir/?api=1&origin={start_lat:.6f},{start_lon:.6f}&destination={dest_lat:.6f},{dest_lon:.6f}&travelmode=walking&dir_action=navigate"
             with nav_lock:
                 nav_state["google_maps_url"] = google_maps_url
 
@@ -468,8 +547,20 @@ def handle_voice_navigation(network, mobile_bridge=None, direct_destination=None
                 )
                 mobile_bridge.send_nav_step(f"Step 1 of {len(structured_steps)}: {first_step}", speak=False)
             
-            # Announce the route found autonomously over 5G earphones
-            announce_guidance(f"Route to {route_res['destination_name']} found. Step 1 of {len(structured_steps)}: {first_step}", mobile_bridge=mobile_bridge)
+            # Announce the route found autonomously over 5G earphones (Group C3)
+            if quiet_reason == "optimize":
+                step_txt = first_step
+                if step_txt.lower().startswith("head out on"):
+                    step_txt = "Continue straight on" + step_txt[11:]
+                elif step_txt.lower().startswith("head out"):
+                    step_txt = "Continue straight" + step_txt[8:]
+                announce_guidance(f"Found a shorter way. {step_txt}", mobile_bridge=mobile_bridge)
+            else:
+                announce_guidance(f"Route to {route_res['destination_name']} found. Step 1 of {len(structured_steps)}: {first_step}", mobile_bridge=mobile_bridge)
+
+            # Lead the user onto the path first if gap exists (Group C2)
+            if nav_state.get("approach_phase"):
+                announce_guidance(f"First walk to the path, about {dist_words(gap_to_path_m)} away.", mobile_bridge=mobile_bridge)
             
             # Optional operator verification link (valid google.com URL, clickable in terminal)
             print(f"🗺️  [OPTIONAL GOOGLE MAPS LINK]: {google_maps_url}")
@@ -532,19 +623,22 @@ def run_edge_server():
     print("\n⏳ Initializing Edge AI Vision & Speech Models...")
     # Using Nano model (yolov8n) for real-time 25ms inference latency (10x faster than medium)
     detector = YoloDetector('yolov8n.pt')
+    HAZARD_IDS = [i for i, n in detector.model.names.items() if n in PEDESTRIAN_COLLISION_CLASSES]
     depth_model = DepthEstimator()
     motion_detector = MotionDetector(walk_threshold=4.5)
+    threat_tracker = ThreatTracker()
     threading.Thread(target=get_whisper_model, daemon=True).start()
     print("✅ All AI models loaded into Server Memory!")
     
     # Ground-Plane Homography & Collision Warning Configuration
-    CAM_HEIGHT_M = 1.25                 # Average wearable camera height from ground (meters)
     COLLISION_ALERT_DISTANCE_M = 3.5    # Warning zone (<= 3.5m)
     CRITICAL_STOP_DISTANCE_M = 1.5      # Critical alert zone (<= 1.5m)
     ALERT_COOLDOWN_WARNING_SEC = 3.0    # 3.0s cooldown gives clear, quiet space for turn navigation
     ALERT_COOLDOWN_CRITICAL_SEC = 2.0   # 2.0s cooldown for critical stop notices
     ALERT_COOLDOWN_IMMEDIATE_SEC = 3.5  # 3.5s cooldown for immediate physical contact bumper
+    LEVEL = {"warning": 1, "critical": 2, "contact": 3}
     last_alert_time = 0
+    last_alert_level = 0
     last_nav_sync_time = 0
     last_telemetry_sync_time = 0
     last_gps_state = "INITIAL"
@@ -581,14 +675,39 @@ def run_edge_server():
     
     cv2.namedWindow("5G Edge Server - Master AI Monitor", cv2.WINDOW_NORMAL)
     
-    wearable_online = False
     wearable_has_connected_once = False
-    wearable_disconnect_logged = False
+    wearable_disconnect_announced = False
     last_recorded_ultra_ts = 0.0
+    phone_was_connected = False
 
     try:
         while True:
             try:
+                # Phone reconnection recovery: resend route & step update if phone reconnects during active navigation
+                phone_now = (mobile_bridge is not None and hasattr(mobile_bridge, 'has_phone_clients') and mobile_bridge.has_phone_clients())
+                if phone_now and not phone_was_connected and nav_state.get("is_active") \
+                        and (time.time() - nav_state.get("last_eval_gps_ts", 0)) < 300:
+                    print("📱 [PHONE RECONNECTED]: Resending route geometry and active step to client...")
+                    if mobile_bridge:
+                        dest_c = nav_state.get("dest_coords") or (26.1928, 91.6985)
+                        mobile_bridge.send_nav_route(
+                            destination=nav_state.get("destination_name", "Destination"),
+                            steps=nav_state.get("structured_steps", []),
+                            total_distance_m=nav_state.get("total_distance_m", 0),
+                            google_maps_url=nav_state.get("google_maps_url", ""),
+                            dest_coords=dest_c,
+                            start_coords=nav_state.get("start_coords"),
+                            route_points=nav_state.get("route_points", [])
+                        )
+                        s_idx = nav_state.get("step_index", 0)
+                        s_tot = nav_state.get("total_steps", 1)
+                        s_steps = nav_state.get("structured_steps", [])
+                        s_inst = s_steps[s_idx]["instruction"] if s_idx < len(s_steps) else ""
+                        mobile_bridge.send_nav_step_update(s_idx, s_tot, s_inst, speak=False, resync=True)
+                    resumed_msg = f"Guidance resumed. {nav_state.get('current_step', '')}"
+                    announce_guidance(resumed_msg, mobile_bridge=mobile_bridge, priority="normal")
+                phone_was_connected = phone_now
+
                 # 3. Check for Voice Navigation Trigger
                 if mobile_bridge.has_voice_command():
                     direct_cmd, is_exact = mobile_bridge.get_voice_command_metadata()
@@ -653,27 +772,25 @@ def run_edge_server():
                 nav_state["gps_mode"] = active_mode
                 # Prioritize ultrasonic proximity from wearable BLE link via mobile_bridge, fallback to local UDP
                 current_ultra = mobile_bridge.get_latest_ultrasonic() if mobile_bridge else None
-                ultra_ts = mobile_bridge.get_latest_ultrasonic_ts() if mobile_bridge else 0.0
-                if current_ultra is None:
+                ultra_ts = (mobile_bridge.get_latest_ultrasonic_ts() if mobile_bridge else 0.0) or 0.0
+                if current_ultra is None and network:
                     net_ultra = network.get_latest_ultrasonic()
                     if net_ultra is not None:
                         current_ultra = net_ultra
-                        ultra_ts = network.get_latest_ultrasonic_ts()
+                        ultra_ts = network.get_latest_ultrasonic_ts() or ultra_ts
 
-                # Track wearable ultrasonic connection status transitions (Issue 4b)
-                if current_ultra is not None:
-                    if not wearable_online:
-                        wearable_online = True
-                        if wearable_has_connected_once:
-                            announce_guidance("Wearable sensor connected.", mobile_bridge=mobile_bridge, priority="normal")
-                        wearable_has_connected_once = True
-                        wearable_disconnect_logged = False
-                else:
-                    if wearable_online and wearable_has_connected_once:
-                        wearable_online = False
-                        if not wearable_disconnect_logged:
-                            wearable_disconnect_logged = True
-                            announce_guidance("Wearable sensor disconnected.", mobile_bridge=mobile_bridge, priority="normal")
+                # Track wearable ultrasonic connection status transitions (Fix 1: announce only real disconnections)
+                gap = (time.time() - ultra_ts) if ultra_ts else 999.0
+                offline_s = NAV_CONFIG.get("wearable_offline_announce_s", 5.0)
+
+                if gap <= 1.5:
+                    if wearable_disconnect_announced:
+                        announce_guidance("Wearable sensor reconnected.", mobile_bridge=mobile_bridge)
+                        wearable_disconnect_announced = False
+                    wearable_has_connected_once = True
+                elif gap > offline_s and wearable_has_connected_once and not wearable_disconnect_announced:
+                    announce_guidance("Wearable sensor disconnected.", mobile_bridge=mobile_bridge)
+                    wearable_disconnect_announced = True
                 
                 # 7. AI Object Detection, Depth Estimation & Dual-Stage Threat Gating
                 valid_threats = []
@@ -683,8 +800,8 @@ def run_edge_server():
                     is_walking = phone_walking or (current_speed >= 0.8)
                 
                 if has_live_camera:
-                    # Lower confidence threshold (0.25) so partially occluded objects are not missed
-                    detections = detector.detect_objects(frame, confidence_threshold=0.25)
+                    # T8: Pass classes=HAZARD_IDS and imgsz=416 to run 1.5-2x faster and isolate relevant hazards
+                    detections = detector.detect_objects(frame, confidence_threshold=0.25, classes=HAZARD_IDS, imgsz=416)
                     
                     # Consolidate walking evaluation using MotionDetector
                     phone_walking = mobile_bridge.is_walking() if mobile_bridge else False
@@ -692,13 +809,27 @@ def run_edge_server():
                     walk_eval = motion_detector.evaluate_walking(current_speed, phone_walking, detections, has_gps=has_gps_fix)
                     is_walking = walk_eval["is_walking"]
                     
-                    # Estimate depth
-                    depth_res = depth_model.estimate_depth(frame)
-                    raw_depth_map = depth_res[0] if isinstance(depth_res, (tuple, list)) else depth_res
-                    if hasattr(raw_depth_map, 'cpu'):
-                        raw_depth_map = raw_depth_map.cpu().numpy()
-                    if hasattr(raw_depth_map, 'ndim') and raw_depth_map.ndim == 3:
-                        raw_depth_map = raw_depth_map.squeeze()
+                    # Estimate depth on demand if fusion is active and a hazard exists in path (Group B2 & T6)
+                    depth_w = NAV_CONFIG.get("depth_fusion_weight", 0.0)
+                    need_depth = (depth_w > 0.0) and any(
+                        str(d.get('class_name', '')).lower() in PEDESTRIAN_COLLISION_CLASSES
+                        and d['bbox'][0] <= frame_width * 0.85 and d['bbox'][2] >= frame_width * 0.15
+                        for d in detections)
+                    raw_depth_map = None
+                    if need_depth and NAV_CONFIG.get("depth_on_demand", True):
+                        depth_res = depth_model.estimate_depth(frame)
+                        raw_depth_map = depth_res[0] if isinstance(depth_res, (tuple, list)) else depth_res
+                        if hasattr(raw_depth_map, 'cpu'):
+                            raw_depth_map = raw_depth_map.cpu().numpy()
+                        if hasattr(raw_depth_map, 'ndim') and raw_depth_map.ndim == 3:
+                            raw_depth_map = raw_depth_map.squeeze()
+                    elif (depth_w > 0.0) and not NAV_CONFIG.get("depth_on_demand", True):
+                        depth_res = depth_model.estimate_depth(frame)
+                        raw_depth_map = depth_res[0] if isinstance(depth_res, (tuple, list)) else depth_res
+                        if hasattr(raw_depth_map, 'cpu'):
+                            raw_depth_map = raw_depth_map.cpu().numpy()
+                        if hasattr(raw_depth_map, 'ndim') and raw_depth_map.ndim == 3:
+                            raw_depth_map = raw_depth_map.squeeze()
                         
                     # Walking corridor boundaries (15% to 85% width)
                     walking_corridor_xmin = int(frame_width * 0.15)
@@ -706,9 +837,10 @@ def run_edge_server():
                     ground_cutoff_ymin    = int(frame_height * 0.82)
                     ceiling_cutoff_ymax   = int(frame_height * 0.12)
                     
-                    # Camera Ground-Plane Homography Parameters
-                    f_y = frame_height * 0.85
-                    y_horizon = int(frame_height * 0.40)
+                    # Camera Ground-Plane Homography Parameters (T7)
+                    cam_h = NAV_CONFIG.get("cam_height_m", 1.25)
+                    f_y = frame_height * NAV_CONFIG.get("cam_focal_frac_y", 0.85)
+                    y_horizon = int(frame_height * NAV_CONFIG.get("cam_horizon_frac", 0.40))
                     corridor_has_yolo_threat = False
                     
                     for det in detections:
@@ -745,11 +877,11 @@ def run_edge_server():
                         if in_path and not is_floor and not is_ceiling:
                             corridor_has_yolo_threat = True
                             
-                            # 1. Ground-Plane Projective Homography: where obstacle base touches the floor
+                            # 1. Ground-Plane Projective Homography (T7)
                             delta_y = max(1.0, float(by2 - y_horizon))
-                            dist_homography = (CAM_HEIGHT_M * f_y) / delta_y
+                            dist_homography = (cam_h * f_y) / delta_y
                             
-                            # 2. Nearest surface depth from MiDaS 85th percentile
+                            # 2. Nearest surface depth from MiDaS 85th percentile (T6)
                             dist_depth = dist_homography
                             if raw_depth_map is not None and hasattr(raw_depth_map, 'shape') and raw_depth_map.ndim == 2:
                                 obj_depth_crop = raw_depth_map[by1:by2, bx1:bx2]
@@ -758,12 +890,19 @@ def run_edge_server():
                                     if closest_depth_val > 1.0:
                                         dist_depth = float(1000.0 / (closest_depth_val + 1e-4))
                             
-                            # Stable fused distance: robust to sitting, crouching, or partial frame occlusion
-                            distance_meters = round(0.75 * dist_homography + 0.25 * dist_depth, 2)
+                            # Stable fused distance (T6): default weight 0.0 uses ground-geometry only
+                            w = NAV_CONFIG.get("depth_fusion_weight", 0.0)
+                            distance_meters = round((1.0 - w) * dist_homography + w * dist_depth, 2)
                             if by2 >= int(frame_height * 0.96):
                                 distance_meters = min(distance_meters, 1.25)
                                 
-                            if 0.3 <= distance_meters <= 6.0:
+                            # Decide "in path" in metres using lateral offset from center line (T5)
+                            f_x = frame_width * NAV_CONFIG.get("cam_focal_frac_x", 0.9)
+                            near_x = min(abs(bx1 - frame_width / 2.0), abs(bx2 - frame_width / 2.0)) if not (bx1 <= frame_width / 2.0 <= bx2) else 0.0
+                            lateral_m = (near_x / f_x) * distance_meters
+                            in_path_m = lateral_m <= NAV_CONFIG.get("path_half_width_m", 0.75)
+
+                            if in_path_m and 0.3 <= distance_meters <= 6.0:
                                 valid_threats.append({
                                     'name': class_name,
                                     'distance': distance_meters,
@@ -777,6 +916,13 @@ def run_edge_server():
                     #     ... (Occupancy grid bypassed for clean outdoor road operation)
                                             
                     valid_threats.sort(key=lambda item: item['distance'])
+                    
+                    # Group B3: Per-object tracking and Time-to-Collision (TTC)
+                    if NAV_CONFIG.get("ttc_alerts_enabled", True) and valid_threats:
+                        threat_tracker.update(valid_threats, now)
+                        def danger(t):  # sort by soonest collision, then by importance, then distance
+                            return (min(t.get('ttc_s', 99), 99), -HAZARD_PRIORITY.get(t['name'], 1), t['distance'])
+                        valid_threats.sort(key=danger)
                     
                     # Draw threat boxes on monitor HUD
                     draw_threat_boxes(frame, valid_threats, is_walking=is_walking, 
@@ -831,6 +977,10 @@ def run_edge_server():
                 obstacle_moving = walk_eval.get("obstacle_moving", False) if (has_live_camera and 'walk_eval' in locals()) else False
                 motion_active = (is_walking or obstacle_moving)
 
+                # Reset alert priority level after 4s cooldown window passes (T1)
+                if now - last_alert_time > 4.0:
+                    last_alert_level = 0
+
                 # -------------------------------------------------------------
                 # LAYER 1: Wearable Ultrasonic Proximity Alarm (Camera-Independent)
                 # -------------------------------------------------------------
@@ -841,15 +991,28 @@ def run_edge_server():
                 crit_cm = NAV_CONFIG.get("ultra_critical_distance_cm", 50.0)
                 if current_ultra is not None and 2.0 <= current_ultra <= 100.0:
                     is_immediate_contact = (current_ultra <= contact_cm)
-                    is_approaching_hazard = (ultra_is_closing and motion_active)
+                    
+                    # Ultrasonic Time-to-Collision (TTC) evaluation (Group B4)
+                    u_speed = 0.0
+                    if len(ultra_history) >= 3:
+                        (d0, t0), (d1, t1) = ultra_history[0], ultra_history[-1]
+                        if t1 - t0 >= 0.3:
+                            u_speed = (d0 - d1) / 100.0 / (t1 - t0)       # m/s
+                    u_ttc = (current_ultra / 100.0) / u_speed if u_speed > 0.15 else float('inf')
+                    
+                    is_approaching_hazard = (ultra_is_closing and motion_active) or \
+                        (NAV_CONFIG.get("ttc_alerts_enabled", True) and u_ttc <= NAV_CONFIG.get("ttc_warning_s", 3.0))
                     
                     if is_immediate_contact or is_approaching_hazard:
-                        is_ultra_critical = (current_ultra <= crit_cm)
+                        is_ultra_critical = (current_ultra <= crit_cm) or \
+                            (NAV_CONFIG.get("ttc_alerts_enabled", True) and u_ttc <= NAV_CONFIG.get("ttc_critical_s", 1.5))
                         active_cooldown = ALERT_COOLDOWN_IMMEDIATE_SEC if is_immediate_contact else (
                             ALERT_COOLDOWN_CRITICAL_SEC if is_ultra_critical else ALERT_COOLDOWN_WARNING_SEC
                         )
+                        level = 3 if is_immediate_contact else (2 if is_ultra_critical else 1)
+                        cooldown_ok = (now - last_alert_time) > active_cooldown or level > last_alert_level
                         
-                        if (now - last_alert_time) > active_cooldown and (not user_speaking or is_immediate_contact):
+                        if cooldown_ok and (not user_speaking or level >= 2):
                             # Fuse semantic obstacle name from Vision AI if an object is in corridor
                             fused_name = "obstacle"
                             if valid_threats and valid_threats[0]['distance'] <= 2.2:
@@ -858,8 +1021,9 @@ def run_edge_server():
                             urgency_level = "critical" if is_ultra_critical else "warning"
                             dist_m = round(current_ultra / 100.0, 2)
                             
-                            if current_ultra <= 15.0:
-                                warning_msg = f"Stop! {fused_name} immediate, {int(current_ultra)} centimeters"
+                            # T9: For touching distance (<= 25cm), "Stop! obstacle immediate" without cm digits is enough
+                            if current_ultra <= 25.0:
+                                warning_msg = f"Stop! {fused_name} immediate"
                             elif is_ultra_critical:
                                 warning_msg = f"Stop! {fused_name} {int(current_ultra)} centimeters"
                             else:
@@ -876,10 +1040,10 @@ def run_edge_server():
                             }
                             network.send_downlink_alert(alert_payload)
                             mobile_bridge.send_threat_alert(warning_msg, obstacle=fused_name, distance_m=dist_m, urgency=urgency_level)
-                            if not (MOBILE_AUDIO_ONLY and mobile_bridge and mobile_bridge.has_phone_clients()):
+                            if NAV_CONFIG.get("laptop_speaks_alerts", True) or not (mobile_bridge and mobile_bridge.has_phone_clients()):
                                 speak_text(warning_msg, async_mode=True)
                             
-                            last_alert_time = now
+                            last_alert_time, last_alert_level = now, level
                             alert_dispatched = True
                             print(f"🚨 [ULTRASONIC APPROACH ALERT ({urgency_level.upper()})]: {warning_msg} (Closing: {ultra_is_closing}, Delta: {current_ultra - ultra_history[0][0]:.1f}cm)")
 
@@ -891,32 +1055,31 @@ def run_edge_server():
                 # 2. Distance is actively decreasing (vision_is_closing or ultra_is_closing)
                 # 3. User is walking or the obstacle is moving (motion_active)
                 if has_live_camera and not alert_dispatched and valid_threats:
-                    primary = valid_threats[0]
-                    dist = primary['distance']
-                    p_name = primary['name']
-                    
-                    if dist <= COLLISION_ALERT_DISTANCE_M:
-                        is_critical = (dist <= CRITICAL_STOP_DISTANCE_M)
-                        closing_in = (vision_is_closing or ultra_is_closing)
+                    # R1: Select the most dangerous confirmed object (>= min_hits) so unconfirmed detections never hide confirmed ones
+                    min_hits = NAV_CONFIG.get("vision_min_hits", 3)
+                    primary = next((t for t in valid_threats if t.get('hits', 0) >= min_hits), None)
+                    if primary is not None:
+                        dist = primary['distance']
+                        p_name = primary['name']
                         
-                        # Only alert when actively closing in on a hazard while in motion
-                        should_alert = closing_in and motion_active
-                        
-                        active_cooldown = ALERT_COOLDOWN_CRITICAL_SEC if is_critical else ALERT_COOLDOWN_WARNING_SEC
-                        cooldown_ready = (now - last_alert_time) > active_cooldown
-                        
-                        if should_alert and (not user_speaking or is_critical) and cooldown_ready:
-                            urgency_level = "critical" if is_critical else "warning"
-                            if is_critical:
-                                bbox_center_x = (primary['bbox'][0] + primary['bbox'][2]) / 2.0
-                                if bbox_center_x < frame_width * 0.38:
-                                    dir_label = "on your left"
-                                elif bbox_center_x > frame_width * 0.62:
-                                    dir_label = "on your right"
-                                else:
-                                    dir_label = "ahead"
-                                warning_msg = f"Stop! {p_name} {dir_label}, {float(dist):.1f} meters"
+                        if dist <= COLLISION_ALERT_DISTANCE_M:
+                            if NAV_CONFIG.get("ttc_alerts_enabled", True):
+                                ttc = primary.get('ttc_s', float('inf'))
+                                is_critical = dist <= CRITICAL_STOP_DISTANCE_M or ttc <= NAV_CONFIG.get("ttc_critical_s", 1.5)
+                                should_alert = ((ttc <= NAV_CONFIG.get("ttc_warning_s", 3.0) and dist <= COLLISION_ALERT_DISTANCE_M)
+                                                or dist <= NAV_CONFIG.get("vision_immediate_m", 1.0))
                             else:
+                                is_critical = (dist <= CRITICAL_STOP_DISTANCE_M)
+                                closing_in = (vision_is_closing or ultra_is_closing)
+                                should_alert = closing_in and motion_active
+                            
+                            active_cooldown = ALERT_COOLDOWN_CRITICAL_SEC if is_critical else ALERT_COOLDOWN_WARNING_SEC
+                            level = 2 if is_critical else 1
+                            cooldown_ready = (now - last_alert_time) > active_cooldown or level > last_alert_level
+                            
+                            # T3: Check threat_tracker.should_alert last so object is not marked alerted if cooldown blocks it
+                            if should_alert and (not user_speaking or is_critical) and cooldown_ready and threat_tracker.should_alert(primary, now):
+                                urgency_level = "critical" if is_critical else "warning"
                                 bbox_center_x = (primary['bbox'][0] + primary['bbox'][2]) / 2.0
                                 if bbox_center_x < frame_width * 0.38:
                                     dir_label = "on your left"
@@ -924,24 +1087,33 @@ def run_edge_server():
                                     dir_label = "on your right"
                                 else:
                                     dir_label = "ahead"
-                                warning_msg = f"{p_name} {dir_label}, {float(dist):.1f} meters"
+
+                                vehicle_classes = {'car', 'bus', 'truck', 'motorcycle', 'bicycle'}
+                                is_fast_vehicle = primary.get('closing_mps', 0.0) > 1.5 and p_name.lower() in vehicle_classes
+                                fast_desc = " approaching fast" if is_fast_vehicle else ""
+
+                                # T9: Use dist_words(dist) for humanized natural speech
+                                if is_critical:
+                                    warning_msg = f"Stop! {p_name}{fast_desc} {dir_label}, {dist_words(dist)}"
+                                else:
+                                    warning_msg = f"{p_name}{fast_desc} {dir_label}, {dist_words(dist)}"
+                                    
+                                alert_payload = {
+                                    "type": "OBSTACLE_WARNING",
+                                    "obstacle": str(p_name),
+                                    "distance_m": float(round(dist, 1)),
+                                    "urgency": urgency_level,
+                                    "text": warning_msg,
+                                    "source": "vision",
+                                    "timestamp": float(now)
+                                }
+                                network.send_downlink_alert(alert_payload)
+                                mobile_bridge.send_threat_alert(warning_msg, obstacle=p_name, distance_m=dist, urgency=urgency_level)
+                                if NAV_CONFIG.get("laptop_speaks_alerts", True) or not (mobile_bridge and mobile_bridge.has_phone_clients()):
+                                    speak_text(warning_msg, async_mode=True)
                                 
-                            alert_payload = {
-                                "type": "OBSTACLE_WARNING",
-                                "obstacle": str(p_name),
-                                "distance_m": float(round(dist, 1)),
-                                "urgency": urgency_level,
-                                "text": warning_msg,
-                                "source": "vision",
-                                "timestamp": float(now)
-                            }
-                            network.send_downlink_alert(alert_payload)
-                            mobile_bridge.send_threat_alert(warning_msg, obstacle=p_name, distance_m=dist, urgency=urgency_level)
-                            if not (MOBILE_AUDIO_ONLY and mobile_bridge and mobile_bridge.has_phone_clients()):
-                                speak_text(warning_msg, async_mode=True)
-                            
-                            last_alert_time = now
-                            print(f"🚨 [VISION APPROACH ALERT ({urgency_level.upper()})]: {warning_msg} (Closing: {vision_is_closing}, Walking: {is_walking})")
+                                last_alert_time, last_alert_level = now, level
+                                print(f"🚨 [VISION APPROACH ALERT ({urgency_level.upper()})]: {warning_msg} (Closing: {vision_is_closing}, Walking: {is_walking})")
                 
                 # 8. Sequential Turn-by-Turn Waypoint Advancement & Continuous Pedestrian Guidance
                 if nav_state["is_active"] and nav_state.get("structured_steps"):
@@ -963,8 +1135,19 @@ def run_edge_server():
                     else:
                         nav_state["phone_disconnect_time"] = None
                     
-                    # Bug 2 & Problem 5: Deliver pending turn message + haptic cue as soon as obstacle quiet period passes
+                    # Periodic guidance if quiet too long (B4)
+                    max_silence = NAV_CONFIG.get("max_silence_sec", 30.0)
+                    time_since_guidance = now_ts - nav_state.get("last_any_guidance", now_ts)
                     quiet_sec = NAV_CONFIG.get("quiet_period_sec", 1.5)
+                    if time_since_guidance > max_silence and (now_ts - last_alert_time) >= quiet_sec:
+                        if nav_state.get("gps_was_weak", False):
+                            announce_guidance("Still waiting for a clear GPS signal. Continue carefully.", mobile_bridge=mobile_bridge)
+                        elif not nav_state.get("approach_phase", False):
+                            d = nav_state.get("last_dist_to_target_m")
+                            msg = f"Continue. {dist_words(d)} to the next instruction." if d else "Guidance active. Continue on the path."
+                            announce_guidance(msg, mobile_bridge=mobile_bridge)
+
+                    # Bug 2 & Problem 5: Deliver pending turn message + haptic cue as soon as obstacle quiet period passes
                     pending_turn = nav_state.get("pending_turn") or nav_state.get("pending_turn_msg")
                     if pending_turn and (now_ts - last_alert_time) >= quiet_sec:
                         nav_state.pop("pending_turn", None)
@@ -1022,6 +1205,11 @@ def run_edge_server():
                                 nav_state["gps_was_weak"] = True
                                 if (now_ts - nav_state.get("last_weak_gps_warn", 0)) > 30.0:
                                     nav_state["last_weak_gps_warn"] = now_ts
+                                    ping_age = (now_ts - getattr(mobile_bridge, 'last_ping_time', now_ts)) if mobile_bridge else 0.0
+                                    if ping_age > 5.0:
+                                        print(f"🌐 [NETWORK STALL]: No phone WebSocket packets/pings for {ping_age:.1f}s.")
+                                    else:
+                                        print(f"🛰️ [GPS STALL]: Network active, but GPS reading is stale/degraded (Age: {gps_age:.1f}s, Acc: ±{current_acc:.1f}m).")
                                     announce_guidance("GPS signal weak, continue carefully.", mobile_bridge=mobile_bridge)
                         else:
                             # Hysteresis recovery: accuracy must stay < 20m and age <= 4s for at least 5.0 continuous seconds
@@ -1062,7 +1250,7 @@ def run_edge_server():
                             user_route_idx = last_u_idx
                             best_dist = float('inf')
                             if r_points:
-                                search_start = max(0, last_u_idx - 8)
+                                search_start = max(0, last_u_idx - 20)
                                 search_end = min(len(r_points), last_u_idx + 60)
                                 best_idx = last_u_idx
                                 for rp_i in range(search_start, search_end):
@@ -1075,24 +1263,81 @@ def run_edge_server():
                                     nav_state["user_route_idx"] = best_idx
                                 user_route_idx = best_idx
 
-                                # Problem 4a: Off-route check on fresh readings
-                                off_thresh = NAV_CONFIG.get("off_route_readings_threshold", 5)
-                                if is_fresh_gps:
-                                    off_m = best_dist * 1000.0
-                                    off_limit = max(NAV_CONFIG.get("off_route_min_distance_m", 20.0),
-                                                    current_acc * NAV_CONFIG.get("off_route_accuracy_multiplier", 1.5))
-                                    nav_state["off_route_count"] = nav_state.get("off_route_count", 0) + 1 if off_m > off_limit else 0
+                                # Track furthest route index reached (peak) and check for backtracking (B3)
+                                if is_fresh_gps and not nav_state.get("approach_phase") and nav_state.get("off_route_count", 0) == 0:
+                                    peak = nav_state.get("route_peak_idx", 0)
+                                    if best_idx > peak:
+                                        nav_state["route_peak_idx"] = best_idx
+                                        nav_state["backtrack_count"] = 0
+                                    else:
+                                        back_m = haversine_distance_km(r_points[peak], r_points[best_idx]) * 1000.0
+                                        nav_state["backtrack_count"] = nav_state.get("backtrack_count", 0) + 1 if back_m >= 20.0 else 0
+                                        if nav_state["backtrack_count"] >= 2 and (now_ts - nav_state.get("last_backtrack_warn", 0)) > 12.0:
+                                            nav_state["last_backtrack_warn"] = now_ts
+                                            nav_state["route_peak_idx"] = best_idx
+                                            nav_state["backtrack_count"] = 0
+                                            print(f"⚠️ [BACKTRACKING]: User moved {back_m:.1f}m back along route (peak={peak}, now={best_idx}). Announcing turn around.")
+                                            announce_guidance("You are walking back along the route. Turn around.",
+                                                              mobile_bridge=mobile_bridge, priority="high", haptic="turn_now")
 
-                                reroute_cool = NAV_CONFIG.get("reroute_cooldown_sec", 20.0)
-                                if nav_state.get("off_route_count", 0) >= off_thresh and (now_ts - nav_state.get("last_reroute", 0)) > reroute_cool:
-                                    nav_state["last_reroute"] = now_ts
-                                    nav_state["off_route_count"] = 0
-                                    print(f"\n⚠️  [OFF ROUTE]: Distance {off_m:.1f}m > {off_limit:.1f}m limit. Rerouting in background...")
-                                    announce_guidance("You have left the route. Please stop. Finding a new route.",
-                                                      mobile_bridge=mobile_bridge, priority="high", haptic="turn_now")
-                                    threading.Thread(target=handle_voice_navigation,
-                                                     args=(network, mobile_bridge, nav_state["destination_name"], True),
-                                                     daemon=True).start()
+                                # Approach phase check & Off-route check on fresh readings (Group C2 & B1)
+                                if nav_state.get("approach_phase"):
+                                    path_start = r_points[0]
+                                    gap_to_path = haversine_distance_km(smooth_gps, path_start) * 1000.0
+                                    reached = gap_to_path < NAV_CONFIG.get("approach_gap_m", 25.0)
+                                    if reached or (now_ts - nav_state.get("approach_start", now_ts)) > 90.0:
+                                        nav_state["approach_phase"] = False
+                                        if reached:
+                                            announce_guidance("You are on the path.", mobile_bridge=mobile_bridge, haptic="arrive")
+                                        else:
+                                            announce_guidance("Continuing guidance from here.", mobile_bridge=mobile_bridge)
+                                    else:
+                                        # Active approach guidance cues (B1)
+                                        prev_gap = nav_state.get("approach_prev_gap", gap_to_path)
+                                        if is_fresh_gps:
+                                            if gap_to_path > prev_gap + 2.0:
+                                                nav_state["approach_away_count"] = nav_state.get("approach_away_count", 0) + 1
+                                            elif gap_to_path < prev_gap - 1.0:
+                                                nav_state["approach_away_count"] = 0
+                                            nav_state["approach_prev_gap"] = gap_to_path
+
+                                        if nav_state.get("approach_away_count", 0) >= 3 and (now_ts - nav_state.get("last_approach_hint", 0)) > 8.0:
+                                            nav_state["last_approach_hint"] = now_ts
+                                            nav_state["approach_away_count"] = 0
+                                            announce_guidance("You are moving away from the path. Turn around.",
+                                                              mobile_bridge=mobile_bridge, priority="high", haptic="turn_now")
+                                        elif (now_ts - nav_state.get("last_approach_hint", 0)) > 8.0:
+                                            nav_state["last_approach_hint"] = now_ts
+                                            bearing_to_path = calculate_bearing(smooth_gps, path_start)
+                                            u_heading = mobile_bridge.get_latest_heading() if mobile_bridge else None
+                                            if u_heading is not None:
+                                                rel = (bearing_to_path - u_heading + 360.0) % 360.0
+                                                clock = round(rel / 30.0) % 12 or 12
+                                                hint = f"Walk toward {clock} o'clock to reach the path. {dist_words(gap_to_path)} remaining."
+                                            else:
+                                                hint = f"Walk toward the path. {dist_words(gap_to_path)} remaining."
+                                            print(f"🚶 [APPROACH HINT]: {hint}")
+                                            announce_guidance(hint, mobile_bridge=mobile_bridge, priority="normal")
+
+                                    nav_state["off_route_count"] = 0  # no false "left the route" while walking to the path
+                                else:
+                                    off_thresh = NAV_CONFIG.get("off_route_readings_threshold", 5)
+                                    if is_fresh_gps:
+                                        off_m = best_dist * 1000.0
+                                        off_limit = max(NAV_CONFIG.get("off_route_min_distance_m", 35.0),
+                                                        current_acc * NAV_CONFIG.get("off_route_accuracy_multiplier", 1.5))
+                                        nav_state["off_route_count"] = nav_state.get("off_route_count", 0) + 1 if off_m > off_limit else 0
+
+                                    reroute_cool = NAV_CONFIG.get("reroute_cooldown_sec", 20.0)
+                                    if nav_state.get("off_route_count", 0) >= off_thresh and (now_ts - nav_state.get("last_reroute", 0)) > reroute_cool:
+                                        nav_state["last_reroute"] = now_ts
+                                        nav_state["off_route_count"] = 0
+                                        print(f"\n⚠️  [OFF ROUTE]: Distance {off_m:.1f}m > {off_limit:.1f}m limit. Rerouting in background...")
+                                        announce_guidance("You have left the route. Please stop. Finding a new route.",
+                                                          mobile_bridge=mobile_bridge, priority="high", haptic="turn_now")
+                                        threading.Thread(target=handle_voice_navigation,
+                                                         args=(network, mobile_bridge, nav_state["destination_name"], True, None, "offroute"),
+                                                         daemon=True).start()
 
                             # Problem 9 & Bug 4: User heading / orientation guidance relative to route
                             user_heading = mobile_bridge.get_latest_heading() if mobile_bridge else None
@@ -1154,8 +1399,24 @@ def run_edge_server():
                                 
                             if target_wp and target_wp[0] != 0 and target_wp[1] != 0:
                                 dist_to_target_m = haversine_distance_km(smooth_gps, (target_wp[0], target_wp[1])) * 1000.0
+                                nav_state["last_dist_to_target_m"] = dist_to_target_m
                                 nav_state["min_dist_to_target"] = min(nav_state.get("min_dist_to_target", 1e9), dist_to_target_m)
                                 min_dist = nav_state["min_dist_to_target"]
+
+                                # Group C4: Better-route check at sensible moments
+                                cfg = NAV_CONFIG
+                                if cfg.get("reopt_enabled", True) and not nav_state.get("reopt_running") and not is_final_step:
+                                    since_switch = now_ts - nav_state.get("last_route_switch", 0)
+                                    since_check  = now_ts - nav_state.get("last_reopt_check", 0)
+                                    gps_improved = nav_state.get("start_acc", 0) > 15 and current_acc < 10 and not nav_state.get("reopt_gps_done")
+                                    after_turn   = 5 < (now_ts - nav_state.get("last_step_advance_time", 0)) < 15
+                                    timer        = since_check > cfg.get("reopt_timer_sec", 150)
+                                    safe_moment  = dist_to_target_m > cfg.get("reopt_no_switch_near_turn_m", 30) and since_switch > cfg.get("reopt_switch_cooldown_sec", 120)
+                                    if safe_moment and since_check > cfg.get("reopt_min_interval_sec", 45) and (gps_improved or after_turn or timer):
+                                        nav_state["last_reopt_check"] = now_ts
+                                        nav_state["reopt_gps_done"] = nav_state.get("reopt_gps_done") or gps_improved
+                                        nav_state["reopt_running"] = True
+                                        threading.Thread(target=reopt_check, args=(network, mobile_bridge, smooth_gps, rid), daemon=True).start()
 
                                 quiet_period = (now_ts - last_alert_time) >= NAV_CONFIG.get("quiet_period_sec", 1.5)
 
@@ -1376,7 +1637,8 @@ def run_edge_server():
                                             else:
                                                 reassurance_dist_m = dist_to_target_m
 
-                                            reassurance_interval = NAV_CONFIG.get("reassurance_bucket_interval_m", 40.0)
+                                            base_iv = NAV_CONFIG.get("reassurance_bucket_interval_m", 40.0)
+                                            reassurance_interval = 200.0 if reassurance_dist_m > 600.0 else (100.0 if reassurance_dist_m > 200.0 else base_iv)
                                             reassurance_cooldown = NAV_CONFIG.get("reassurance_cooldown_sec", 15.0)
                                             milestone_bucket = int(reassurance_dist_m // reassurance_interval) * int(reassurance_interval)
                                             last_bucket = nav_state.get("last_milestone_announced", 99999)

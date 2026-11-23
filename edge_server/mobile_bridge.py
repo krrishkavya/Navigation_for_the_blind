@@ -74,6 +74,7 @@ class MobileBridgeServer:
         self.pending_destination_confirmation = False
         self.pending_step_change = None
         self.latest_google_maps_url = ""
+        self.last_ping_time = time.time()
         
         self.active_websockets = set()
         self.client_roles = {}
@@ -135,6 +136,7 @@ class MobileBridgeServer:
                             data = json.loads(message)
                             msg_type = data.get("type")
                             
+                            self.last_ping_time = time.time()
                             if msg_type == "hello":
                                 role = str(data.get("role", "phone")).lower()
                                 with self.lock:
@@ -824,7 +826,7 @@ class MobileBridgeServer:
         for ws in sockets:
             asyncio.run_coroutine_threadsafe(self._safe_ws_send(ws, payload), self.loop)
 
-    def send_nav_step_update(self, step_index, total_steps, step_text, speak=True):
+    def send_nav_step_update(self, step_index, total_steps, step_text, speak=True, resync=False):
         """Pushes a sequential step advancement to the mobile client."""
         if not self.loop or not self.is_running:
             return
@@ -833,7 +835,8 @@ class MobileBridgeServer:
             "step_index": int(step_index),
             "total_steps": int(total_steps),
             "step_text": str(step_text),
-            "speak": bool(speak)
+            "speak": bool(speak),
+            "resync": bool(resync)
         })
         sockets = self._get_phone_sockets()
         for ws in sockets:

@@ -16,6 +16,9 @@ if hasattr(sys.stdout, 'reconfigure'):
 # Spatial distance ceiling: Strictly reject any destination farther than 35 km
 MAX_SEARCH_RADIUS_KM = 35.0
 
+# Server failure tracker to avoid blocking on repeatedly rejected servers
+_REJECT_COUNT = {}
+
 import os
 import json
 
@@ -202,6 +205,22 @@ def geocode_location(location_name, near_coords=None, max_radius_km=MAX_SEARCH_R
     print(f"❌ No matching destination found within {max_radius_km} km of current location.")
     return None
 
+def _load_nav_routing_config():
+    cfg_file = os.path.join(os.path.dirname(__file__), "nav_config.json")
+    cfg = {
+        "route_max_detour_factor": 3.0,
+        "route_detour_allow_m": 800.0,
+        "route_max_snap_m": 80.0,
+        "route_prefer_foot_pct": 0.15
+    }
+    if os.path.exists(cfg_file):
+        try:
+            with open(cfg_file, "r", encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except Exception:
+            pass
+    return cfg
+
 def get_walking_route_details(start_coords, end_coords, include_metadata=False):
     """
     Fetches walking directions from OSRM including turn-by-turn steps,
@@ -211,21 +230,66 @@ def get_walking_route_details(start_coords, end_coords, include_metadata=False):
     start_lat, start_lon = start_coords
     end_lat, end_lon = end_coords
     
-    url = f"http://router.project-osrm.org/route/v1/foot/{start_lon},{start_lat};{end_lon},{end_lat}"
-    
     params = {
         'steps': 'true',
         'overview': 'full',
         'geometries': 'geojson'
     }
     
+    headers = {'User-Agent': '5G_Wearable_Navigation_Project_Dev/1.0'}
+    ROUTING_BASES = [
+        ("foot_server", "https://routing.openstreetmap.de/routed-foot/route/v1/foot"),
+        ("osrm_demo",   "http://router.project-osrm.org/route/v1/foot"),
+    ]
+    cfg = _load_nav_routing_config()
+    max_factor   = float(cfg.get("route_max_detour_factor", 3.0))     # reject routes longer than 3x the straight-line distance
+    detour_allow = float(cfg.get("route_detour_allow_m", 800.0))      # ...plus this allowance (metres) for very short trips
+    max_snap_m   = float(cfg.get("route_max_snap_m", 80.0))          # reject if the server moved the start or end further than this
+    prefer_pct   = float(cfg.get("route_prefer_foot_pct", 0.15))       # prefer the walking server if it's at most 15% longer
+
+    straight_m = haversine_distance_km(start_coords, end_coords) * 1000.0
+
+    def _fetch(name_base):
+        name, base = name_base
+        url = f"{base}/{start_lon},{start_lat};{end_lon},{end_lat}"
+        timeout = 4 if name == "foot_server" else 8
+        try:
+            d = requests.get(url, params=params, headers=headers, timeout=timeout).json()
+            if d.get('code') != 'Ok' or not d.get('routes'):
+                return None                                   # no counting for errors
+            dist = float(d['routes'][0].get('distance', 0))
+            wps = d.get('waypoints') or [{}, {}]
+            start_snap = float(wps[0].get('distance', 0) or 0)
+            end_snap = float(wps[-1].get('distance', 0) or 0)
+            ok = (dist <= max(max_factor * straight_m, straight_m + detour_allow)
+                  and start_snap <= max_snap_m and end_snap <= max_snap_m)
+            if ok:
+                _REJECT_COUNT[name] = 0                       # good route resets the count
+            elif name == "foot_server":
+                _REJECT_COUNT[name] = _REJECT_COUNT.get(name, 0) + 1
+            print(f"🧭 [ROUTING CANDIDATE] {name}: {dist:.0f} m | start moved {start_snap:.0f} m | "
+                  f"end moved {end_snap:.0f} m{'' if ok else '  ❌ rejected'}")
+            return {"name": name, "data": d, "dist": dist, "ok": ok}
+        except Exception as e:
+            print(f"🧭 [ROUTING CANDIDATE] {name}: unavailable ({e})")
+            return None                                   # no counting for network errors
+
     try:
-        response = requests.get(url, params=params, timeout=8)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data['code'] != 'Ok' or not data.get('routes'):
+        from concurrent.futures import ThreadPoolExecutor
+        active_bases = [nb for nb in ROUTING_BASES
+                        if not (nb[0] == "foot_server" and _REJECT_COUNT.get("foot_server", 0) >= 3)]
+        with ThreadPoolExecutor(max_workers=len(active_bases)) as pool:
+            candidates = [c for c in pool.map(_fetch, active_bases) if c and c["ok"]]
+
+        if not candidates:
+            print(f"❌ [ROUTING]: No sensible walking route (straight-line {straight_m:.0f} m).")
             return ([], 0, [], []) if include_metadata else ([], 0, [])
+
+        shortest = min(candidates, key=lambda c: c["dist"])
+        foot = next((c for c in candidates if c["name"] == "foot_server"), None)
+        chosen = foot if (foot and foot["dist"] <= shortest["dist"] * (1 + prefer_pct)) else shortest
+        print(f"✅ [ROUTING CHOSEN]: {chosen['name']} ({chosen['dist']:.0f} m)")
+        data = chosen["data"]
 
         route = data['routes'][0]
         total_distance = int(route.get('distance', 0))
@@ -253,6 +317,8 @@ def get_walking_route_details(start_coords, end_coords, include_metadata=False):
                 instruction = f"Head out on {street_name} for {distance} meters." if distance > 0 else f"Head out on {street_name}."
             elif maneuver == 'arrive':
                 instruction = "You have arrived at your destination."
+            elif modifier == 'straight':
+                instruction = f"Continue straight on {street_name} for {distance} meters."
             elif modifier:
                 instruction = f"Turn {modifier.replace('-', ' ')} onto {street_name}, and walk for {distance} meters."
             else:

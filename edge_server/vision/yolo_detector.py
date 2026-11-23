@@ -10,12 +10,12 @@ class YoloDetector:
         self.model = YOLO(model_size)
         print("✅ YOLOv8 Model loaded successfully!")
 
-    def detect_objects(self, frame, confidence_threshold=0.5):
+    def detect_objects(self, frame, confidence_threshold=0.5, classes=None, imgsz=416):
         """
         Takes an OpenCV video frame, runs inference, and returns detected objects.
         """
         # Run YOLOv8 inference on the frame (verbose=False hides the console spam)
-        results = self.model(frame, verbose=False)[0]
+        results = self.model(frame, imgsz=imgsz, classes=classes, verbose=False)[0]
         
         detections = []
         # Loop through all the bounding boxes YOLO found

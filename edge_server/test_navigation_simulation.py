@@ -403,6 +403,8 @@ async def run_simulation(dest_name=DEFAULT_DESTINATION, ws_url="ws://127.0.0.1:8
                             print(f"\n   🚨 [HAZARD ALERT ({urg})]: \"{t}\"")
 
                         elif in_type == "nav_step_update":
+                            if in_msg.get("resync"):
+                                continue  # re-sync after (re)connection, not a real step change
                             s_idx = in_msg.get("step_index", 0)
                             s_txt = in_msg.get("step_text") or in_msg.get("step", "")
                             step_updates.append({"index": s_idx, "text": s_txt, "time": time.time()})
@@ -452,6 +454,8 @@ async def run_simulation(dest_name=DEFAULT_DESTINATION, ws_url="ws://127.0.0.1:8
                                 if "arrived" in t.lower():
                                     arrived = True
                             elif in_type == "nav_step_update":
+                                if in_msg.get("resync"):
+                                    continue  # re-sync after (re)connection, not a real step change
                                 s_idx = in_msg.get("step_index", 0)
                                 s_txt = in_msg.get("step_text") or in_msg.get("step", "")
                                 step_updates.append({"index": s_idx, "text": s_txt, "time": time.time()})
@@ -485,6 +489,8 @@ async def run_simulation(dest_name=DEFAULT_DESTINATION, ws_url="ws://127.0.0.1:8
                             if "arrived" in t.lower():
                                 arrived = True
                         elif in_type == "nav_step_update":
+                            if in_msg.get("resync"):
+                                continue  # re-sync after (re)connection, not a real step change
                             s_idx = in_msg.get("step_index", 0)
                             s_txt = in_msg.get("step_text") or in_msg.get("step", "")
                             step_updates.append({"index": s_idx, "text": s_txt, "time": time.time()})

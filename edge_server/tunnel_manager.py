@@ -40,8 +40,11 @@ def publish_cloud_sync_url(url: str):
             if resp.status == 200:
                 print(f"📡 [CLOUD SYNC]: Published live tunnel URL for Wearable discovery: {url}")
                 return True
-    except Exception:
-        pass
+    except urllib.error.HTTPError as e:
+        reason = "daily ntfy quota reached" if e.code == 429 else e.reason
+        print(f"❌ [CLOUD SYNC FAILED]: HTTP {e.code} — {reason}")
+    except Exception as e:
+        print(f"❌ [CLOUD SYNC FAILED]: {e}")
     return False
 
 def generate_qr_image(url, size=(280, 280), border=3):
@@ -127,9 +130,6 @@ class CloudflareTunnelManager:
         self.project_root = os.path.abspath(os.path.join(current_dir, ".."))
         self.url_file_path = os.path.join(self.project_root, "active_tunnel_url.txt")
         self.qr_file_path = os.path.join(current_dir, "qr_code.png")
-        
-        # Check if URL was previously saved in the last 15 minutes
-        self._load_cached_url()
 
     def _load_cached_url(self):
         try:
@@ -179,15 +179,24 @@ class CloudflareTunnelManager:
         threading.Thread(target=self._heartbeat_sync_worker, daemon=True).start()
 
     def _heartbeat_sync_worker(self):
-        """Periodically refreshes the active tunnel URL in Cloud Sync so Wearable can always discover it."""
+        """Refreshes the active tunnel URL in Cloud Sync only when it changes or every 30 minutes."""
+        last_published = None
+        last_publish_time = 0.0
         while self.is_running:
+            sleep_duration = 10.0
             try:
                 url = self.get_tunnel_url()
-                if url:
-                    publish_cloud_sync_url(url)
+                now = time.time()
+                # Only publish if URL changed, or to renew every 30 minutes (1800s)
+                if url and (url != last_published or (now - last_publish_time) > 1800.0):
+                    if publish_cloud_sync_url(url):
+                        last_published = url
+                        last_publish_time = now
+                    else:
+                        sleep_duration = 60.0
             except Exception:
                 pass
-            time.sleep(35.0)
+            time.sleep(sleep_duration)
 
     def _run_tunnel_process(self, binary_path):
         cmd = [binary_path, "tunnel", "--url", f"http://localhost:{self.port}"]
@@ -235,9 +244,6 @@ class CloudflareTunnelManager:
                                     
                                 # Print beautiful terminal QR Code
                                 print_terminal_qr(full_url)
-                                
-                                # Publish to Cloud Sync for autonomous Wearable client discovery
-                                threading.Thread(target=publish_cloud_sync_url, args=(full_url,), daemon=True).start()
                                 
         except Exception as e:
             if self.is_running:

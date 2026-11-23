@@ -10,6 +10,7 @@
     }
 
     let reconnectAttempts = 0;
+    let connLostSpoken = false, everConnected = false;
 
     // Connect WebSocket to Edge Server
     function connectWebSocket() {
@@ -19,6 +20,8 @@
 
       ws.onopen = () => {
         reconnectAttempts = 0;
+        if (connLostSpoken) { say("Guidance reconnected.", 3); connLostSpoken = false; }
+        everConnected = true;
         console.log("✅ WebSocket connected to Edge Server!");
         ws.send(JSON.stringify({ type: "hello", "role": "phone" }));
         const badge = document.getElementById('netBadge');
@@ -29,6 +32,17 @@
         // Request wake lock so iOS does not sleep screen while walking
         requestScreenWakeLock();
 
+        // Sync active Cloudflare URL to Cloud Sync bus for Arduino auto-discovery (from mobile cellular IP)
+        if (window.location.origin.includes("trycloudflare.com")) {
+          try {
+            fetch("https://ntfy.sh/iitg_5g_wearable_nav_sync_9169957", {
+              method: "POST",
+              headers: { "Title": "Active5GTunnelURL" },
+              body: window.location.origin
+            }).catch(() => {});
+          } catch(e) {}
+        }
+
         // Immediately send GPS fix to Edge Server if already available
         if (lastLat != null && lastLon != null) {
           sendGpsTelemetry(lastLat, lastLon, lastAcc, lastSpd);
@@ -37,6 +51,7 @@
       };
 
       ws.onclose = () => {
+        if (everConnected && !connLostSpoken) { say("Connection to guidance lost. Please stop and wait.", 1); connLostSpoken = true; }
         const badge = document.getElementById('netBadge');
         if (badge) badge.className = "badge";
         const netTxt = document.getElementById('netText');
@@ -287,8 +302,10 @@
     // Handle incoming AI alerts and navigation cues from Laptop Edge Server
     function handleDownlinkMessage(msg) {
       if (msg.type === "threat_alert") {
-        // If user is actively speaking/recording, update visual banner but do not blast audio into microphone
-        if (isRecordingAudio || isListening) {
+        const isCrit = (msg.urgency === 'critical' || (msg.distance_m != null && msg.distance_m <= 1.5));
+
+        // If user is actively speaking/recording, silence non-critical warnings but allow critical ones through
+        if ((isRecordingAudio || isListening) && !isCrit) {
           const banner = document.getElementById('threatBanner');
           if (banner) {
             banner.textContent = `🚨 ${msg.text.toUpperCase()}`;
@@ -301,8 +318,6 @@
         const banner = document.getElementById('threatBanner');
         banner.textContent = `🚨 ${msg.text.toUpperCase()}`;
         banner.style.display = 'block';
-
-        const isCrit = (msg.urgency === 'critical' || (msg.distance_m != null && msg.distance_m <= 1.5));
 
         // 1. Instant zero-latency earcon sound (<10ms playback)
         playWarningChime(isCrit ? 'critical' : 'warning');
@@ -621,6 +636,14 @@
         }
       }
     }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        requestScreenWakeLock();
+        if (!ws || ws.readyState === WebSocket.CLOSED) connectWebSocket();
+        requestImmediateGpsFix();
+      }
+    });
 
     // --- Web Bluetooth (BLE) Manager for Arduino UNO Q ---
     let bleDevice = null;

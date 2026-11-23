@@ -25,6 +25,20 @@ if hasattr(cv2, "setLogLevel"):
 # 100% Autonomous Cloud Sync (Auto-discovers the active server with zero field edits).
 CLOUDFLARE_URL   = "" 
 
+def load_manual_url():
+    """Reads manual Cloudflare URL override from CLOUDFLARE_URL or local tunnel_url.txt."""
+    if CLOUDFLARE_URL and CLOUDFLARE_URL.strip():
+        return CLOUDFLARE_URL.strip()
+    try:
+        filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tunnel_url.txt")
+        if os.path.exists(filepath):
+            with open(filepath, "r", encoding="utf-8") as f:
+                u = f.read().strip()
+                return u if u.startswith("https://") else ""
+    except Exception:
+        pass
+    return "" 
+
 # Shared Cloud Sync Topic (Matches edge_server/tunnel_manager.py for zero-touch discovery)
 CLOUD_SYNC_TOPIC = "iitg_5g_wearable_nav_sync_9169957"
 
@@ -36,7 +50,7 @@ def fetch_active_cloud_url(timeout=3.0):
     import urllib.request
     try:
         req = urllib.request.Request(
-            f"https://ntfy.sh/{CLOUD_SYNC_TOPIC}/json?poll=1",
+            f"https://ntfy.sh/{CLOUD_SYNC_TOPIC}/json?poll=1&since=45m",
             headers={"User-Agent": "Wearable-Arduino-Client"}
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -52,6 +66,11 @@ def fetch_active_cloud_url(timeout=3.0):
                             return url
                 except Exception:
                     pass
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            print("⚠️ [CLOUD SYNC]: ntfy.sh rate limit reached (HTTP 429). Retrying later...")
+        else:
+            print(f"⚠️ [CLOUD SYNC]: HTTP error {e.code}: {e.reason}")
     except Exception:
         pass
     return None
@@ -137,8 +156,13 @@ class RawWebSocketClient:
                     break
                 response += chunk
 
-            if b"101" in response:
+            status_line = response.split(b"\r\n", 1)[0]
+            if b" 101 " in status_line:
                 self.is_connected = True
+                try:
+                    self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except Exception:
+                    pass
                 try:
                     self.send_text(json.dumps({"type": "hello", "role": "wearable"}))
                 except Exception:
@@ -215,6 +239,20 @@ def init_hardware_link():
             print("🔌 [HARDWARE LINK]: Successfully linked to STM32 MCU via RouterBridge!")
             bridge_instance = b
             hardware_connected = True
+            
+            # Dedicated background worker to poll MCU distance at 10 Hz without blocking main loop
+            def bridge_worker():
+                global current_distance_cm
+                while True:
+                    try:
+                        val = b.call("get_distance", timeout=0.15)
+                        if val is not None:
+                            current_distance_cm = float(val)
+                    except Exception:
+                        pass
+                    time.sleep(0.10)
+            
+            threading.Thread(target=bridge_worker, daemon=True).start()
             return
         else:
             print("ℹ️ RouterBridge connect timeout. Attempting serial fallback...")
@@ -266,20 +304,10 @@ def init_hardware_link():
         print("⚠️ [HARDWARE NOTICE]: Waiting for STM32 MCU heartbeat...")
 
 # -------------------------------------------------------------------------
-# Read Real Ultrasonic Distance from MCU
+# Read Real Ultrasonic Distance from MCU (Non-blocking background read)
 # -------------------------------------------------------------------------
 def read_ultrasonic_distance():
-    global current_distance_cm, bridge_instance
-    if bridge_instance:
-        try:
-            # Query the live distance from the get_distance function in sketch.ino
-            val = bridge_instance.call("get_distance", timeout=0.20)
-            if val is not None:
-                current_distance_cm = float(val)
-                return round(current_distance_cm, 1)
-        except Exception:
-            pass  # Fall through to last recorded distance
-            
+    global current_distance_cm
     return round(current_distance_cm, 1)
 
 # -------------------------------------------------------------------------
@@ -418,12 +446,20 @@ def main():
 
     # 3. Detect onboard/USB camera
     cap = detect_camera()
-    last_camera_retry_time = 0
-    last_telemetry_time = 0
-    last_ws_reconnect_time = 0
+    last_camera_retry_time = 0.0
+    last_telemetry_time = 0.0
+    last_ws_reconnect_time = 0.0
+    last_frame_sent = 0.0
+    skip_frames_until = 0.0
+
+    # Video compression & rate limits matched to Edge Server YOLO 416
+    VIDEO_FPS = 8                  # frames actually sent per second
+    JPEG_QUALITY = 50
+    FRAME_SIZE = (416, 277)        # matches the server's YOLO input size
 
     # Cross-Network Cloudflare Uplink Client with Autonomous Cloud Sync
-    active_cloud_url = CLOUDFLARE_URL.strip() if (CLOUDFLARE_URL and CLOUDFLARE_URL.strip()) else None
+    manual_override = load_manual_url()
+    active_cloud_url = manual_override if manual_override else None
     
     script_dir = os.path.dirname(os.path.abspath(__file__))
     cache_file = os.path.join(script_dir, "last_known_tunnel_url.txt")
@@ -448,6 +484,8 @@ def main():
                         print(f"📂 [CLOUD SYNC CACHE]: Using last known URL: {active_cloud_url}")
             except Exception:
                 pass
+    else:
+        print(f"🔒 [MANUAL URL LOCKED]: Using static Cloudflare URL: {active_cloud_url}")
 
     use_cloudflare = bool(active_cloud_url)
     ws_client = None
@@ -465,54 +503,40 @@ def main():
             now = time.time()
             dist_cm = read_ultrasonic_distance()
 
-            # Auto-reconnect Cloudflare WebSocket if connection drops, or discover on the fly
+            # Auto-reconnect Cloudflare WebSocket if connection drops
             if not ws_client or not ws_client.is_connected:
-                if now - last_ws_reconnect_time >= 4.0:
-                    last_ws_reconnect_time = now
-                    # Check if server announced a URL or changed URL
-                    discovered = fetch_active_cloud_url(timeout=2.0)
-                    if discovered:
-                        current_url = getattr(ws_client, "url", "") if ws_client else ""
-                        if discovered != current_url:
-                            print(f"✨ [CLOUD SYNC]: Linked to Edge Server: {discovered}")
+                manual_url = load_manual_url()
+                if manual_url:
+                    if now - last_ws_reconnect_time >= 4.0:
+                        last_ws_reconnect_time = now
+                        if not ws_client or getattr(ws_client, "url", "") != manual_url:
                             if ws_client:
                                 ws_client.close()
-                            ws_client = RawWebSocketClient(discovered)
+                            ws_client = RawWebSocketClient(manual_url)
                             use_cloudflare = True
-                            try:
-                                with open(cache_file, "w") as f:
-                                    f.write(discovered)
-                            except Exception:
-                                pass
-                    if ws_client:
                         ws_client.connect()
-
-            # --- 1. CAMERA STREAMING WITH AUTO-RECONNECT ---
-            if cap is not None and cap.isOpened():
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    # Resize to 480x320 and encode as JPEG (Quality 65) for low latency
-                    frame_resized = cv2.resize(frame, (480, 320))
-                    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 65]
-                    result, encimg = cv2.imencode('.jpg', frame_resized, encode_param)
-                    if result:
-                        payload = encimg.tobytes()
-                        if use_cloudflare and ws_client and ws_client.is_connected:
-                            ws_client.send_binary(payload)
-                        elif not use_cloudflare and len(payload) < 65000:
-                            uplink_sock.sendto(payload, (EDGE_SERVER_IP, VIDEO_PORT))
                 else:
-                    # Camera lost connection
-                    print("⚠️ Camera frame drop. Re-detecting camera...")
-                    cap.release()
-                    cap = None
-            else:
-                # Hot-plug detection: periodically check for newly plugged USB camera
-                if now - last_camera_retry_time >= 3.0:
-                    last_camera_retry_time = now
-                    cap = detect_camera()
+                    if now - last_ws_reconnect_time >= 10.0:
+                        last_ws_reconnect_time = now
+                        # Check if server announced a URL or changed URL
+                        discovered = fetch_active_cloud_url(timeout=5.0)
+                        if discovered:
+                            current_url = getattr(ws_client, "url", "") if ws_client else ""
+                            if discovered != current_url:
+                                print(f"✨ [CLOUD SYNC]: Linked to Edge Server: {discovered}")
+                                if ws_client:
+                                    ws_client.close()
+                                ws_client = RawWebSocketClient(discovered)
+                                use_cloudflare = True
+                                try:
+                                    with open(cache_file, "w") as f:
+                                        f.write(discovered)
+                                except Exception:
+                                    pass
+                        if ws_client:
+                            ws_client.connect()
 
-            # --- 2. SENSOR TELEMETRY UPLINK (10 Hz / every 100ms) ---
+            # --- 1. SENSOR TELEMETRY UPLINK (10 Hz / every 100ms) - ALWAYS SENT FIRST ---
             if now - last_telemetry_time >= 0.1:
                 if use_cloudflare and ws_client and ws_client.is_connected:
                     telemetry_msg = json.dumps({
@@ -539,7 +563,39 @@ def main():
                     cam_status = "Online" if (cap is not None and cap.isOpened()) else "Standby (Detecting USB Camera...)"
                     print(f"📡 [5G Telemetry ➔ {dest}] Distance: {dist_cm:.1f} cm | Camera: {cam_status}", flush=True)
 
-            time.sleep(0.04) # ~25 FPS loop pace
+            # --- 2. CAMERA STREAMING WITH UPLINK PACING & BACKPRESSURE (Fix 2 & Fix 3) ---
+            if cap is not None and cap.isOpened():
+                if (now - last_frame_sent >= 1.0 / VIDEO_FPS) and (now >= skip_frames_until):
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        frame_resized = cv2.resize(frame, FRAME_SIZE)
+                        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+                        result, encimg = cv2.imencode('.jpg', frame_resized, encode_param)
+                        if result:
+                            payload = encimg.tobytes()
+                            if use_cloudflare and ws_client and ws_client.is_connected:
+                                t0 = time.time()
+                                ok_send = ws_client.send_binary(payload)
+                                send_ms = (time.time() - t0) * 1000.0
+                                last_frame_sent = now
+                                if send_ms > 150.0:
+                                    # Network link is congested; skip subsequent video frames to flush TCP queues
+                                    skip_frames_until = now + 0.5
+                            elif not use_cloudflare and len(payload) < 65000:
+                                uplink_sock.sendto(payload, (EDGE_SERVER_IP, VIDEO_PORT))
+                                last_frame_sent = now
+                    else:
+                        # Camera lost connection
+                        print("⚠️ Camera frame drop. Re-detecting camera...")
+                        cap.release()
+                        cap = None
+            else:
+                # Hot-plug detection: periodically check for newly plugged USB camera
+                if now - last_camera_retry_time >= 3.0:
+                    last_camera_retry_time = now
+                    cap = detect_camera()
+
+            time.sleep(0.02) # ~50 Hz loop pace for tight, non-blocking telemetry & video timing
 
     except KeyboardInterrupt:
         print("\nStopping Wearable Client...")
